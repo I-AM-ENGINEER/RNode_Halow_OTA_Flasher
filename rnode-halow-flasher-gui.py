@@ -30,7 +30,6 @@ Requires "modules/" (same as rnode-halow-utils.py):
 from __future__ import annotations
 
 import json
-import platform
 import struct
 import queue
 import shutil
@@ -47,11 +46,18 @@ from typing import Any, Dict, Optional, Tuple, List, Set
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from scapy.all import Ether, Raw, AsyncSniffer, sendp  # type: ignore
+from scapy.all import Ether, Raw, AsyncSniffer  # type: ignore
 
 from modules import scan_all_parallel
 from modules import HgicSession
 from modules.hgic_scan import scan_iface
+from modules.hgic_device import (
+    RawEthernetAccessError,
+    async_sniffer_start_safe,
+    async_sniffer_stop_safe,
+    raw_ethernet_access_message,
+    sendp_safe,
+)
 from modules.hgic_ota import ETH_P_OTA
 from modules.hgic_ota_tar import inspect_ota_tar
 
@@ -105,43 +111,9 @@ def parse_format_littlefs_resp_payload(b: bytes) -> Optional[int]:
 
 
 # ----------------------------
-# PCAP check
-# ----------------------------
-
-def pcap_available() -> bool:
-    try:
-        from scapy.all import conf  # type: ignore
-    except Exception:
-        return False
-    return bool(getattr(conf, "use_pcap", False))
-
-
-def pcap_missing_message() -> str:
-    system = platform.system()
-    if system == "Windows":
-        return (
-            "No packet capture backend (pcap) detected.\n\n"
-            "Npcap is required on Windows.\n"
-            "Download it from:\n"
-            "  https://npcap.com/dist/"
-        )
-    if system == "Linux":
-        return (
-            "No packet capture backend (pcap) detected.\n\n"
-            "libpcap is required on Linux.\n"
-            "  debian: sudo apt install libpcap-dev\n"
-            "  fedora: sudo dnf install libpcap\n\n"
-            "Then run this script with sudo (or grant needed capabilities)."
-        )
-    return (
-        "No packet capture backend (pcap) detected.\n\n"
-        "A libpcap-compatible backend is required on this platform."
-    )
-
-
-# ----------------------------
 # Helpers
 # ----------------------------
+
 
 def strip_quotes(s: str) -> str:
     s = s.strip()
@@ -490,20 +462,13 @@ class App(tk.Tk):
         # busy (UI only)
         self._busy = threading.Event()
 
-        # startup pcap check
-        self.withdraw()
-        if not pcap_available():
-            try:
-                messagebox.showerror("pcap backend missing", pcap_missing_message())
-            except Exception:
-                pass
-            self.destroy()
-            return
+        # one-shot raw Ethernet access warning
+        self._raw_ethernet_warning_queued = threading.Event()
+        self._raw_ethernet_warning_shown = False
 
         self._build_ui()
         self._refresh_builtin_fw_list()
         self._set_fw_builtin(self._fw_builtin_name.get().strip())
-        self.deiconify()
 
         # timers/threads
         self.after(60, self._poll_queue)
@@ -634,6 +599,22 @@ class App(tk.Tk):
     def _log_line(self, s: str, tag: str = "") -> None:
         self._log.insert(tk.END, s + "\n", tag)
         self._log.see(tk.END)
+
+    def _queue_raw_ethernet_warning(self, msg: Optional[str] = None) -> None:
+        if self._raw_ethernet_warning_queued.is_set():
+            return
+        self._raw_ethernet_warning_queued.set()
+        self._q.put(("raw_ethernet_warning", str(msg or raw_ethernet_access_message())))
+
+    def _show_raw_ethernet_warning_once(self, msg: str) -> None:
+        if self._raw_ethernet_warning_shown:
+            return
+        self._raw_ethernet_warning_shown = True
+        self._log_line(f"[WARN] {msg.replace(chr(10), ' ')}", "err")
+        try:
+            messagebox.showwarning("Raw Ethernet access required", msg)
+        except Exception:
+            pass
 
     def _set_progress(self, pct: float, done: int = 0, total: int = 0, speed: float = 0.0) -> None:
         pct = max(0.0, min(100.0, float(pct)))
@@ -922,6 +903,9 @@ class App(tk.Tk):
             return
         try:
             devs = scan_all_parallel(packet_cnt=10, period_sec=main_timeout(0.010), sniff_time=main_timeout(0.5))
+        except RawEthernetAccessError as e:
+            self._queue_raw_ethernet_warning(str(e))
+            return
         except Exception as e:
             self._q.put(("log", (f"[ERR] scan failed: {e}", "err")))
             return
@@ -993,6 +977,8 @@ class App(tk.Tk):
                             break
 
             self._q.put(("devinfo", (key, ip_s, ver_s)))
+        except RawEthernetAccessError as e:
+            self._queue_raw_ethernet_warning(str(e))
         finally:
             self._ip_jobs_inflight.discard(key)
 
@@ -1181,6 +1167,8 @@ class App(tk.Tk):
                     self._q.put(("log", ("[OK] flash done", "ok")))
 
             self._maybe_poll_ip(self._rows.get(r.key(), r))
+        except RawEthernetAccessError as e:
+            self._queue_raw_ethernet_warning(str(e))
         except Exception as e:
             self._q.put(("log", (f"[ERR] flash failed: {e}", "err")))
         finally:
@@ -1211,6 +1199,9 @@ class App(tk.Tk):
     def _scan_live_targets(self, state: FlashTargetState) -> List[Tuple[str, str]]:
         try:
             devs = scan_iface(state.iface_id, packet_cnt=6, period_sec=main_timeout(0.010), sniff_time=main_timeout(0.35))
+        except RawEthernetAccessError as e:
+            self._queue_raw_ethernet_warning(str(e))
+            return []
         except Exception:
             return []
 
@@ -1285,6 +1276,9 @@ class App(tk.Tk):
                 mac = state.current_mac
             try:
                 ans = sess.get_ip(mac, tries=1, timeout=main_timeout(0.5))
+            except RawEthernetAccessError as e:
+                self._queue_raw_ethernet_warning(str(e))
+                ans = None
             except Exception:
                 ans = None
             if ans is not None:
@@ -1311,12 +1305,12 @@ class App(tk.Tk):
 
         for _ in range(3):
             sn = AsyncSniffer(iface=sess.iface, store=True, lfilter=is_my_resp)
-            sn.start()
+            async_sniffer_start_safe(sn)
             try:
-                sendp(frame, iface=sess.iface, verbose=False)
+                sendp_safe(frame, iface=sess.iface, verbose=False)
                 sn.join(timeout=main_timeout(15.0))
             finally:
-                pkts = sn.stop() or []
+                pkts = async_sniffer_stop_safe(sn) or []
 
             for p in pkts:
                 status = parse_format_littlefs_resp_payload(bytes(p[Raw].load))
@@ -1357,6 +1351,8 @@ class App(tk.Tk):
                     self._q.put(("log", ("[*] reboot", "stage")))
                     sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
                     self._q.put(("log", ("[OK] reboot sent", "ok")))
+        except RawEthernetAccessError as e:
+            self._queue_raw_ethernet_warning(str(e))
         except Exception as e:
             self._q.put(("log", (f"[ERR] reboot failed: {e}", "err")))
         finally:
@@ -1435,6 +1431,8 @@ class App(tk.Tk):
 
             # refresh ip/version (best-effort)
             self._maybe_poll_ip(self._rows.get(r.key(), r))
+        except RawEthernetAccessError as e:
+            self._queue_raw_ethernet_warning(str(e))
         except Exception as e:
             self._q.put(("log", (f"[ERR] update failed: {e}", "err")))
         finally:
@@ -1477,6 +1475,8 @@ class App(tk.Tk):
                     self._q.put(("log", ("[*] reboot", "stage")))
                     sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
                     self._q.put(("log", ("[OK] reboot sent", "ok")))
+        except RawEthernetAccessError as e:
+            self._queue_raw_ethernet_warning(str(e))
         except Exception as e:
             self._q.put(("log", (f"[ERR] RAW flash failed: {e}", "err")))
         finally:
@@ -1543,6 +1543,9 @@ class App(tk.Tk):
                 elif kind == "log":
                     s, tag = payload
                     self._log_line(str(s), tag or "")
+
+                elif kind == "raw_ethernet_warning":
+                    self._show_raw_ethernet_warning_once(str(payload))
 
                 elif kind == "progress":
                     pct, done, total, speed = payload

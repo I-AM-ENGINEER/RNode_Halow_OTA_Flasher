@@ -12,7 +12,7 @@ from typing import Callable, Optional
 
 from scapy.all import AsyncSniffer, Ether, Raw  # type: ignore
 
-from .hgic_device import HgicDevice
+from .hgic_device import HgicDevice, async_sniffer_start_safe, async_sniffer_stop_safe
 from .hgic_ota import (
     ETH_P_OTA,
     FwAck,
@@ -86,7 +86,7 @@ class HgicFlasher:
 
         # print(f"[DBG] sniffer starting on iface={self.dev.iface} dev_mac={dev_mac} host_mac={host_mac}", flush=True)
         sniffer = AsyncSniffer(iface=self.dev.iface, store=False, prn=on_packet)
-        sniffer.start()
+        async_sniffer_start_safe(sniffer)
         # print(f"[DBG] sniffer started", flush=True)
 
         off = 0
@@ -133,4 +133,4 @@ class HgicFlasher:
                     progress_cb(done, total, speed)
         finally:
             if sniffer.running:
-                sniffer.stop(join=False)
+                async_sniffer_stop_safe(sniffer, join=False)

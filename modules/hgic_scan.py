@@ -11,7 +11,7 @@ from typing import Optional
 
 from scapy.all import Ether, Raw  # type: ignore
 
-from .hgic_device import HgicDevice, iter_ifaces
+from .hgic_device import HgicDevice, RawEthernetAccessError, iter_ifaces
 from .hgic_ota import ETH_P_OTA, pack_scan_req, parse_scan_report_payload
 
 
@@ -80,19 +80,35 @@ def scan_iface(iface: str, *, packet_cnt: int = 10, period_sec: float = 0.010, s
             )
         )
 
-    dev.send_periodic_broadcast(pack_scan_req(), count=packet_cnt, period_sec=period_sec)
+    send_err: list[Exception] = []
+
+    def on_send_error(exc: Exception) -> None:
+        if not send_err:
+            send_err.append(exc)
+
+    dev.send_periodic_broadcast(pack_scan_req(), count=packet_cnt, period_sec=period_sec, on_error=on_send_error)
     dev.sniff(timeout=sniff_time, prn=on_packet, store=False)
+
+    if send_err:
+        raise send_err[0]
+
     return found
 
 
 def scan_all_parallel(packet_cnt: int = 10, period_sec: float = 0.010, sniff_time: float = 0.5) -> list[ScanReport]:
     out: list[ScanReport] = []
+    first_err: list[Exception] = []
     lock = threading.Lock()
     thrs: list[threading.Thread] = []
 
     def worker(iface: str):
         try:
             res = scan_iface(iface, packet_cnt=packet_cnt, period_sec=period_sec, sniff_time=sniff_time)
+        except RawEthernetAccessError as exc:
+            with lock:
+                if not first_err:
+                    first_err.append(exc)
+            return
         except Exception:
             return
         if not res:
@@ -107,5 +123,8 @@ def scan_all_parallel(packet_cnt: int = 10, period_sec: float = 0.010, sniff_tim
 
     for t in thrs:
         t.join()
+
+    if first_err:
+        raise first_err[0]
 
     return out

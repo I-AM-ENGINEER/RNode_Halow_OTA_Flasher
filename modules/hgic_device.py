@@ -7,6 +7,7 @@ This module is responsible for scapy send/sniff and interface helpers.
 
 from __future__ import annotations
 
+import errno
 import threading
 import time
 from dataclasses import dataclass
@@ -16,6 +17,61 @@ from scapy.all import Ether, Raw, conf, get_if_hwaddr, get_if_list, sendp, sniff
 
 from .hgic_ota import ETH_P_OTA
 from .hgic_ota import parse_mac
+
+
+class RawEthernetAccessError(RuntimeError):
+    pass
+
+
+_RAW_ETHERNET_ACCESS_MESSAGE = (
+    "No access to raw Ethernet.\n\n"
+    "This protocol uses a non-standard Ethernet frame format. "
+    "Run the application with sudo to detect devices."
+)
+
+
+def raw_ethernet_access_message() -> str:
+    return _RAW_ETHERNET_ACCESS_MESSAGE
+
+
+def _raw_ethernet_access_error(exc: BaseException) -> Optional[RawEthernetAccessError]:
+    if isinstance(exc, RawEthernetAccessError):
+        return exc
+    if isinstance(exc, PermissionError):
+        return RawEthernetAccessError(_RAW_ETHERNET_ACCESS_MESSAGE)
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in (errno.EPERM, errno.EACCES):
+        return RawEthernetAccessError(_RAW_ETHERNET_ACCESS_MESSAGE)
+    return None
+
+
+def raise_raw_ethernet_access_error(exc: BaseException) -> None:
+    err = _raw_ethernet_access_error(exc)
+    if err is not None:
+        raise err from exc
+
+
+def sendp_safe(frame, *, iface: str, verbose: bool = False) -> None:
+    try:
+        sendp(frame, iface=iface, verbose=verbose)
+    except Exception as exc:
+        raise_raw_ethernet_access_error(exc)
+        raise
+
+
+def async_sniffer_start_safe(sniffer) -> None:
+    try:
+        sniffer.start()
+    except Exception as exc:
+        raise_raw_ethernet_access_error(exc)
+        raise
+
+
+def async_sniffer_stop_safe(sniffer, **kwargs):
+    try:
+        return sniffer.stop(**kwargs)
+    except Exception as exc:
+        raise_raw_ethernet_access_error(exc)
+        raise
 
 
 def _sniff_safe(
@@ -38,7 +94,10 @@ def _sniff_safe(
             promisc=promisc,
             filter=bpf,
         )
-    except Exception:
+    except Exception as exc:
+        raise_raw_ethernet_access_error(exc)
+
+    try:
         return sniff(
             iface=iface,
             timeout=timeout,
@@ -47,6 +106,9 @@ def _sniff_safe(
             store=store,
             promisc=promisc,
         )
+    except Exception as exc:
+        raise_raw_ethernet_access_error(exc)
+        raise
 
 
 def _iface_title_windows(iface: str) -> str:
@@ -109,13 +171,13 @@ class HgicDevice:
     def send(self, *, dst_mac: str, payload: bytes) -> None:
         dst = parse_mac(dst_mac)
         frame = Ether(dst=dst, src=self.host_mac, type=ETH_P_OTA) / Raw(load=payload)
-        sendp(frame, iface=self.iface, verbose=False)
+        sendp_safe(frame, iface=self.iface, verbose=False)
 
     def send_broadcast(self, payload: bytes) -> None:
         if not _iface_is_up(self.iface):
             return
         frame = Ether(dst="ff:ff:ff:ff:ff:ff", src=self.host_mac, type=ETH_P_OTA) / Raw(load=payload)
-        sendp(frame, iface=self.iface, verbose=False)
+        sendp_safe(frame, iface=self.iface, verbose=False)
 
     def sniff(
         self,
@@ -135,11 +197,27 @@ class HgicDevice:
             bpf=f"ether proto 0x{ETH_P_OTA:04x}",
         )
 
-    def send_periodic_broadcast(self, payload: bytes, *, count: int, period_sec: float, start_delay: float = 0.1) -> None:
+    def send_periodic_broadcast(
+        self,
+        payload: bytes,
+        *,
+        count: int,
+        period_sec: float,
+        start_delay: float = 0.1,
+        on_error: Optional[Callable[[Exception], None]] = None,
+    ) -> None:
         def sender():
             time.sleep(start_delay)
             for _ in range(count):
-                self.send_broadcast(payload)
+                try:
+                    self.send_broadcast(payload)
+                except Exception as exc:
+                    if on_error is not None:
+                        try:
+                            on_error(exc)
+                        except Exception:
+                            pass
+                    return
                 time.sleep(period_sec)
 
         threading.Thread(target=sender, daemon=True).start()

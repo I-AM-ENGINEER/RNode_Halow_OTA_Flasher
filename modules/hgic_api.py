@@ -15,10 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from scapy.all import Ether, Raw, srp1  # type: ignore
-from scapy.all import Ether, Raw, sendp, AsyncSniffer, srp1
+from scapy.all import Ether, Raw, AsyncSniffer  # type: ignore
 
-from .hgic_device import HgicDevice
+from .hgic_device import (
+    HgicDevice,
+    async_sniffer_start_safe,
+    async_sniffer_stop_safe,
+    sendp_safe,
+)
 from .hgic_flash import HgicFlasher
 from .hgic_ota_tar import load_fw_bin_from_ota_tar
 from .hgic_tftp_ota import TftpOtaConfig, upload_ota_files_tftp
@@ -62,9 +66,9 @@ class HgicSession:
         for _ in range(int(count)):
             self._dev.send(dst_mac=dst, payload=payload)
             time.sleep(float(period_sec))
-            
+
     def get_ip(self, dst_mac: str, *, tries: int = 5, timeout: float = 0.4) -> Optional[IpInfo]:
-        dst_mac_s  = str(dst_mac).lower()
+        dst_mac_s = str(dst_mac).lower()
         host_mac_s = str(self._dev.host_mac).lower()
         payload = pack_get_ip_req()
 
@@ -80,12 +84,12 @@ class HgicSession:
             frame = Ether(src=host_mac_s, dst=dst_mac_s, type=ETH_P_OTA) / Raw(load=payload)
 
             sn = AsyncSniffer(iface=self._dev.iface, store=True, lfilter=is_my_resp)
-            sn.start()
+            async_sniffer_start_safe(sn)
             try:
-                sendp(frame, iface=self._dev.iface, verbose=False)
+                sendp_safe(frame, iface=self._dev.iface, verbose=False)
                 sn.join(timeout=float(timeout))
             finally:
-                pkts = sn.stop() or []
+                pkts = async_sniffer_stop_safe(sn) or []
 
             for p in pkts:
                 r = parse_get_ip_resp_payload(bytes(p[Raw].load))
@@ -145,50 +149,43 @@ class HgicSession:
                 last_err = e
                 if attempt >= attempts:
                     break
-                if retry_cb:
-                    retry_cb(attempt, attempts, str(e))
+                if retry_cb is not None:
+                    try:
+                        retry_cb(attempt, attempts, str(e))
+                    except Exception:
+                        pass
                 time.sleep(float(retry_delay))
 
-        assert last_err is not None
-        raise RuntimeError(f"flash failed after {attempts} attempts: {last_err}") from last_err
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("flash failed")
 
     def flash_fs(
         self,
         dst_mac: str,
         ota_tar: Path | str,
         *,
-        getip_tries: int = 8,
-        getip_timeout: float = 0.5,
-        tftp_cfg: TftpOtaConfig = TftpOtaConfig(),
+        tmp_dir: Optional[Path | str] = None,
+        tftp_host_ip: str = "192.168.100.10",
+        device_http_port: int = 80,
+        wait_reboot_s: float = 3.0,
+        upload_timeout_s: float = 300.0,
+        poll_interval_s: float = 1.0,
         stage_cb: Optional[Callable[[str], None]] = None,
         progress_cb: Optional[Callable[[int, int, float], None]] = None,
-    ) -> IpInfo:
-        """Upload filesystem files from ota.tar directly over TFTP.
-
-        Steps:
-          1) GET_IP over Ethernet (custom OTA ethertype)
-          2) Upload every non-fw.bin file from ota.tar to the device TFTP server
-
-        Returns resolved IpInfo.
-        """
-
-        info = self.get_ip(dst_mac, tries=int(getip_tries), timeout=float(getip_timeout))
-        if info is None:
-            raise RuntimeError("GET_IP failed")
-
-        ip_s = str(info.ip)
-        if ip_s == "0.0.0.0":
-            raise RuntimeError("device reported 0.0.0.0")
-
-        if stage_cb:
-            stage_cb(f"Device IP: {ip_s}")
-
+    ) -> None:
         upload_ota_files_tftp(
-            ip_s,
-            Path(ota_tar),
-            cfg=tftp_cfg,
-            stage_cb=stage_cb,
-            progress_cb=progress_cb,
+            ota_tar=Path(ota_tar),
+            config=TftpOtaConfig(
+                dst_mac=str(dst_mac),
+                iface=self.iface,
+                tftp_host_ip=str(tftp_host_ip),
+                device_http_port=int(device_http_port),
+                wait_reboot_s=float(wait_reboot_s),
+                upload_timeout_s=float(upload_timeout_s),
+                poll_interval_s=float(poll_interval_s),
+                tmp_dir=(Path(tmp_dir) if tmp_dir is not None else None),
+                stage_cb=stage_cb,
+                progress_cb=progress_cb,
+            ),
         )
-
-        return info
