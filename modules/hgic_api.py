@@ -165,27 +165,29 @@ class HgicSession:
         dst_mac: str,
         ota_tar: Path | str,
         *,
-        tmp_dir: Optional[Path | str] = None,
-        tftp_host_ip: str = "192.168.100.10",
-        device_http_port: int = 80,
-        wait_reboot_s: float = 3.0,
-        upload_timeout_s: float = 300.0,
-        poll_interval_s: float = 1.0,
+        getip_tries: int = 8,
+        getip_timeout: float = 0.5,
+        tftp_cfg: TftpOtaConfig = TftpOtaConfig(),
         stage_cb: Optional[Callable[[str], None]] = None,
         progress_cb: Optional[Callable[[int, int, float], None]] = None,
-    ) -> None:
+    ) -> IpInfo:
+        info = self.get_ip(dst_mac, tries=int(getip_tries), timeout=float(getip_timeout))
+        if info is None:
+            raise RuntimeError("GET_IP failed")
+
+        ip_s = str(info.ip)
+        if ip_s == "0.0.0.0":
+            raise RuntimeError("device reported 0.0.0.0")
+
+        if stage_cb:
+            stage_cb(f"Device IP: {ip_s}")
+
         upload_ota_files_tftp(
-            ota_tar=Path(ota_tar),
-            config=TftpOtaConfig(
-                dst_mac=str(dst_mac),
-                iface=self.iface,
-                tftp_host_ip=str(tftp_host_ip),
-                device_http_port=int(device_http_port),
-                wait_reboot_s=float(wait_reboot_s),
-                upload_timeout_s=float(upload_timeout_s),
-                poll_interval_s=float(poll_interval_s),
-                tmp_dir=(Path(tmp_dir) if tmp_dir is not None else None),
-                stage_cb=stage_cb,
-                progress_cb=progress_cb,
-            ),
+            ip_s,
+            Path(ota_tar),
+            cfg=tftp_cfg,
+            stage_cb=stage_cb,
+            progress_cb=progress_cb,
         )
+
+        return info

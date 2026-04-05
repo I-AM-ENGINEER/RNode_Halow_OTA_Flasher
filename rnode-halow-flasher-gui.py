@@ -317,9 +317,21 @@ class GhAsset:
 class GhRelease:
     tag: str
     assets: List[GhAsset]
+    prerelease: bool = False
 
 
-def github_list_release_tags(timeout_s: float = main_timeout(8.0)) -> List[GhRelease]:
+def gh_release_label(rel: GhRelease) -> str:
+    tag = str(rel.tag or "").strip()
+    if rel.prerelease:
+        return f"{tag} (beta)"
+    return tag
+
+
+def github_list_release_tags(
+    *,
+    include_prerelease: bool = False,
+    timeout_s: float = main_timeout(8.0),
+) -> List[GhRelease]:
     import urllib.request
     req = urllib.request.Request(GITHUB_API_RELEASES, headers={"User-Agent": "rnode-halow-gui"})
     with _urlopen(req, timeout_s) as r:
@@ -334,6 +346,10 @@ def github_list_release_tags(timeout_s: float = main_timeout(8.0)) -> List[GhRel
             continue
         tag = str(rr.get("tag_name") or "").strip()
         if not tag:
+            continue
+
+        prerelease = bool(rr.get("prerelease"))
+        if prerelease and not include_prerelease:
             continue
 
         assets: List[GhAsset] = []
@@ -352,7 +368,7 @@ def github_list_release_tags(timeout_s: float = main_timeout(8.0)) -> List[GhRel
                     continue
                 assets.append(GhAsset(name=nm, size=sz, url=url))
 
-        rels.append(GhRelease(tag=tag, assets=assets))
+        rels.append(GhRelease(tag=tag, assets=assets, prerelease=prerelease))
 
     return rels
 
@@ -426,6 +442,15 @@ class FlashTargetState:
     blacklist_macs: Set[str] = field(default_factory=set)
 
 
+@dataclass(frozen=True)
+class FirmwareSelection:
+    source: str
+    mode: str
+    path: Optional[Path]
+    label: str
+    github_tag: str = ""
+
+
 # ----------------------------
 # App
 # ----------------------------
@@ -486,7 +511,11 @@ class App(tk.Tk):
         self._gh_status = tk.StringVar(value="GitHub: …")
         self._gh_tags: List[str] = []
         self._gh_rels: Dict[str, GhRelease] = {}
+        self._gh_display_to_tag: Dict[str, str] = {}
+        self._gh_tag_to_display: Dict[str, str] = {}
+        self._gh_force_latest_on_refresh = False
         self._gh_tag = tk.StringVar(value="")
+        self._gh_show_beta = tk.BooleanVar(value=False)
 
         # scanning
         self._auto_refresh = tk.BooleanVar(value=True)
@@ -537,6 +566,12 @@ class App(tk.Tk):
         self._gh_combo.bind("<<ComboboxSelected>>", self._gh_tag_selected)
 
         ttk.Button(fw_top, text="Refresh", command=self._gh_refresh_async).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            fw_top,
+            text="Show beta versions",
+            variable=self._gh_show_beta,
+            command=self._gh_show_beta_changed,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         fw_mid = ttk.Frame(fw)
         fw_mid.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(2, 2))
@@ -712,14 +747,14 @@ class App(tk.Tk):
             p = self._fw_gh_path
             m = (self._fw_gh_mode or "").strip()
             info = self._fw_gh_info
-            if p and p.is_file() and m in ("ota", "bin"):
-                self._fw_path.set(str(p))
+            if m in ("ota", "bin"):
+                self._fw_path.set(str(p) if (p and p.is_file()) else "")
                 self._fw_mode.set(m)
                 self._fw_info.set(info)
             else:
                 self._fw_path.set("")
                 self._fw_mode.set("")
-                self._fw_info.set("")
+                self._fw_info.set(info)
         elif is_builtin_source(src):
             p = self._fw_builtin_path
             m = (self._fw_builtin_mode or "").strip()
@@ -848,64 +883,113 @@ class App(tk.Tk):
 
     def _gh_refresh_worker(self) -> None:
         try:
-            rels = github_list_release_tags(timeout_s=main_timeout(8.0))
+            rels = github_list_release_tags(
+                include_prerelease=bool(self._gh_show_beta.get()),
+                timeout_s=main_timeout(8.0),
+            )
             self._q.put(("gh_rels", rels))
         except Exception as e:
             self._q.put(("gh_err", str(e)))
 
-    def _gh_tag_selected(self, _evt=None) -> None:
-        if self._fw_source.get().strip() != "github":
-            return
-        tag = self._gh_tag.get().strip()
-        if not tag:
-            return
-        threading.Thread(target=self._gh_use_tag_worker, args=(tag,), daemon=True).start()
+    def _gh_show_beta_changed(self) -> None:
+        self._gh_force_latest_on_refresh = True
+        self._gh_refresh_async()
 
-    def _gh_use_tag_worker(self, tag: str) -> None:
-        rel = self._gh_rels.get(tag)
+    def _gh_asset_for_tag(self, tag: str) -> Tuple[GhRelease, GhAsset]:
+        rel = self._gh_rels.get(str(tag or "").strip())
         if not rel:
-            self._q.put(("log", (f"[ERR] GitHub: tag not found: {tag}", "err")))
-            return
+            raise RuntimeError(f"GitHub tag not found: {tag}")
         asset = github_pick_asset(rel)
         if not asset:
-            self._q.put(("log", (f"[ERR] GitHub: no .tar/.bin asset in {tag}", "err")))
+            raise RuntimeError(f"GitHub release has no .tar/.bin asset: {tag}")
+        return rel, asset
+
+    def _gh_cached_path(self, tag: str, asset: GhAsset) -> Path:
+        return self._gh_tmp_dir / str(tag) / asset.name
+
+    def _gh_cache_is_valid(self, path: Path, asset: GhAsset) -> bool:
+        try:
+            if not path.is_file():
+                return False
+            if int(asset.size or 0) > 0:
+                return int(path.stat().st_size) == int(asset.size)
+            return path.stat().st_size > 0
+        except Exception:
+            return False
+
+    def _gh_sync_selection(self) -> None:
+        selected = self._gh_tag.get().strip()
+        tag = self._gh_display_to_tag.get(selected, selected)
+        if selected != tag:
+            self._gh_tag.set(selected)
+        if not tag:
+            self._fw_gh_path = None
+            self._fw_gh_mode = ""
+            self._fw_gh_info = ""
+            self._fw_gh_tag = ""
+            if self._fw_source.get().strip() == "github":
+                self._apply_fw_view()
             return
 
-        # download into a per-run temp directory (requested)
-        if self._gh_tmp is None:
-            self._gh_tmp = tempfile.TemporaryDirectory(prefix="rnode_halow_github_")
-        out_dir = Path(self._gh_tmp.name) / tag
-        out_path = out_dir / asset.name
-
-        if asset.is_bin:
-            # confirmation in UI thread
-            self._q.put(("gh_confirm_bin", (tag, asset.name)))
-
-        # download (NO pcap lock; should not block scanning)
-        self._q.put(("log", (f"[*] GitHub: downloading {tag}", "stage")))
-
-        def cb(done: int, total: int, speed: float) -> None:
-            pct = (done * 100.0 / total) if total else 0.0
-            self._q.put(("progress", (pct, done, total, speed)))
-
         try:
-            github_download(asset.url, out_path, progress_cb=cb, timeout_s=main_timeout(30.0))
-            self._q.put(("fw_set", (str(out_path), "ota" if asset.is_tar else "bin", tag)))
-            self._q.put(("log", (f"[OK] GitHub ready: {tag}", "ok")))
+            rel, asset = self._gh_asset_for_tag(tag)
         except Exception as e:
-            self._q.put(("log", (f"[ERR] GitHub download failed: {e}", "err")))
-        finally:
-            self._q.put(("progress", (0.0, 0, 0, 0.0)))
+            self._fw_gh_path = None
+            self._fw_gh_mode = ""
+            self._fw_gh_info = f"GitHub {tag}: {e}"
+            self._fw_gh_tag = tag
+            if self._fw_source.get().strip() == "github":
+                self._apply_fw_view()
+            return
+
+        cached_path = self._gh_cached_path(tag, asset)
+        mode = "ota" if asset.is_tar else "bin"
+        if self._gh_cache_is_valid(cached_path, asset):
+            suffix = " (cached)"
+        else:
+            suffix = " (will download on flash)"
+
+        label = gh_release_label(rel)
+        if asset.is_bin:
+            info = f"GitHub {label} (raw){suffix}"
+        else:
+            info = f"GitHub {label}{suffix}"
+
+        self._fw_gh_path = cached_path if self._gh_cache_is_valid(cached_path, asset) else None
+        self._fw_gh_mode = mode
+        self._fw_gh_info = info
+        self._fw_gh_tag = tag
+        if self._fw_source.get().strip() == "github":
+            self._apply_fw_view()
+
+    def _gh_tag_selected(self, _evt=None) -> None:
+        self._gh_sync_selection()
+
+    def _gh_get_or_download(self, tag: str, progress_cb=None) -> Tuple[Path, str]:
+        _rel, asset = self._gh_asset_for_tag(tag)
+        out_path = self._gh_cached_path(tag, asset)
+        mode = "ota" if asset.is_tar else "bin"
+
+        if self._gh_cache_is_valid(out_path, asset):
+            self._q.put(("fw_set", (str(out_path), mode, tag)))
+            return out_path, mode
+
+        self._q.put(("log", (f"[*] GitHub: downloading {tag}", "stage")))
+        github_download(asset.url, out_path, progress_cb=progress_cb, timeout_s=main_timeout(30.0))
+        self._q.put(("fw_set", (str(out_path), mode, tag)))
+        self._q.put(("log", (f"[OK] GitHub ready: {tag}", "ok")))
+        return out_path, mode
 
     def _set_fw_github(self, path: Path, mode: str, tag: str) -> None:
         # store github selection; apply only if github radiobutton is active
         self._fw_gh_path = path
         self._fw_gh_mode = str(mode or "").strip()
         self._fw_gh_tag = str(tag or "").strip()
+        label = self._gh_tag_to_display.get(self._fw_gh_tag, self._fw_gh_tag)
         if self._fw_gh_mode == "bin":
-            self._fw_gh_info = f"GitHub {self._fw_gh_tag} (raw)"
+            self._fw_gh_info = f"GitHub {label} (raw)"
         elif self._fw_gh_mode == "ota":
-            self._fw_gh_info = f"GitHub {self._fw_gh_tag}"
+            self._fw_gh_info = f"GitHub {label}"
         else:
             self._fw_gh_info = ""
 
@@ -1045,30 +1129,54 @@ class App(tk.Tk):
 
     # ---------- Actions ----------
 
-    def _ensure_fw_path(self) -> Optional[Tuple[Path, str, str]]:
+    def _ensure_fw_selection(self) -> Optional[FirmwareSelection]:
         src = self._fw_source.get().strip()
+
         if src == "github":
-            tag = self._gh_tag.get().strip()
+            selected = self._gh_tag.get().strip()
+            tag = self._gh_display_to_tag.get(selected, selected)
             if not tag:
                 return None
             if (self._fw_gh_tag or "").strip() != tag:
+                self._gh_sync_selection()
+            try:
+                _rel, asset = self._gh_asset_for_tag(tag)
+            except Exception:
                 return None
-            if not self._fw_gh_path or not self._fw_gh_path.is_file():
-                return None
-        elif is_builtin_source(src):
-            if not self._fw_builtin_path or not self._fw_builtin_path.is_file():
-                return None
-        else:
-            if not self._fw_local_path or not self._fw_local_path.is_file():
-                return None
+            mode = "ota" if asset.is_tar else "bin"
+            path = self._gh_cached_path(tag, asset)
+            return FirmwareSelection(
+                source=src,
+                mode=mode,
+                path=(path if self._gh_cache_is_valid(path, asset) else None),
+                label=asset.name,
+                github_tag=tag,
+            )
 
-        p = resolve_path(self._fw_path.get()) if self._fw_path.get().strip() else None
-        mode = self._fw_mode.get().strip()
-        if not p or not p.is_file():
+        if is_builtin_source(src):
+            p = self._fw_builtin_path
+            mode = (self._fw_builtin_mode or "").strip()
+            if not p or not p.is_file() or mode not in ("bin",):
+                return None
+            return FirmwareSelection(source=src, mode=mode, path=p, label=p.name)
+
+        p = self._fw_local_path
+        mode = (self._fw_local_mode or "").strip()
+        if not p or not p.is_file() or mode not in ("ota", "bin"):
             return None
-        if mode not in ("ota", "bin"):
-            return None
-        return (p, mode, src)
+        return FirmwareSelection(source=src, mode=mode, path=p, label=p.name)
+
+    def _resolve_selection_path(
+        self,
+        sel: FirmwareSelection,
+        *,
+        progress_cb=None,
+    ) -> Tuple[Path, str]:
+        if sel.source == "github":
+            return self._gh_get_or_download(sel.github_tag, progress_cb=progress_cb)
+        if not sel.path or not sel.path.is_file():
+            raise FileNotFoundError("firmware file not found")
+        return sel.path, sel.mode
 
     def _ensure_selected(self) -> Optional[DevRow]:
         if not self._selected_key:
@@ -1085,31 +1193,15 @@ class App(tk.Tk):
         if not r:
             return
 
-        fw = self._ensure_fw_path()
+        fw = self._ensure_fw_selection()
         if not fw:
             messagebox.showerror("No firmware", "Select a firmware first.")
             return
 
-        fw_path, mode, src = fw
-        have_ip = bool((r.ip or "").strip())
-
-        fw_name = fw_path.name
-        has_www_dir = False
-        needs_preflash = not is_builtin_source(src)
-        if mode == "ota":
-            try:
-                info = inspect_ota_tar(fw_path)
-                if src == "github":
-                    fw_name = "./" + str(info.fw_member_name).lstrip("./")
-                has_www_dir = bool(info.has_www_dir)
-            except Exception as e:
-                messagebox.showerror("Invalid OTA", f"Invalid ota.tar: {e}")
-                return
-
-        preflash_name = ""
+        needs_preflash = not is_builtin_source(fw.source)
         if needs_preflash:
             try:
-                preflash_name = pick_preflash_firmware_name()
+                pick_preflash_firmware_name()
             except Exception as e:
                 messagebox.showerror("Built-in firmware missing", str(e))
                 return
@@ -1117,7 +1209,7 @@ class App(tk.Tk):
         confirm_msg = f"Device: {r.mac}\n"
         if (r.ip or "").strip():
             confirm_msg += f"IP: {r.ip}\n"
-        confirm_msg += f"\nFirmware: {fw_name or fw_path.name}\n\nProceed?"
+        confirm_msg += f"\nFirmware: {fw.label}\n\nProceed?"
 
         if not messagebox.askyesno(
             "Confirm flash",
@@ -1131,18 +1223,14 @@ class App(tk.Tk):
         self._set_progress(0.0, 0, 0, 0.0)
         threading.Thread(
             target=self._flash_worker,
-            args=(r, fw_path, mode, have_ip, needs_preflash, has_www_dir),
+            args=(r, fw),
             daemon=True,
         ).start()
 
     def _flash_worker(
         self,
         r: DevRow,
-        fw_path: Path,
-        mode: str,
-        have_ip: bool,
-        needs_preflash: bool,
-        has_www_dir: bool,
+        fw_sel: FirmwareSelection,
     ) -> None:
         try:
             with self._pcap_lock:
@@ -1161,6 +1249,13 @@ class App(tk.Tk):
 
                     def cb_retry(attempt: int, total: int, err: str) -> None:
                         self._q.put(("log", (f"[!] flash attempt {attempt}/{total} failed: {err}; retry in 3s", "err")))
+
+                    fw_path, mode = self._resolve_selection_path(fw_sel, progress_cb=cb_progress)
+                    needs_preflash = not is_builtin_source(fw_sel.source)
+                    has_www_dir = False
+                    if mode == "ota":
+                        info = inspect_ota_tar(fw_path)
+                        has_www_dir = bool(info.has_www_dir)
 
                     if needs_preflash:
                         preflash_name = pick_preflash_firmware_name()
@@ -1620,14 +1715,25 @@ class App(tk.Tk):
 
                 elif kind == "gh_rels":
                     rels: List[GhRelease] = payload
+                    prev_selected = self._gh_tag.get().strip()
+                    prev_tag = self._gh_display_to_tag.get(prev_selected, prev_selected)
                     self._gh_rels = {r.tag: r for r in rels}
                     self._gh_tags = [r.tag for r in rels]
-                    self._gh_combo["values"] = self._gh_tags
-                    if self._gh_tags and not self._gh_tag.get().strip():
-                        self._gh_tag.set(self._gh_tags[0])
-                        # auto download/activate first tag
-                        self._gh_tag_selected()
-                    self._gh_status.set(f"GitHub: {len(self._gh_tags)} release(s)")
+                    self._gh_display_to_tag = {gh_release_label(r): r.tag for r in rels}
+                    self._gh_tag_to_display = {r.tag: gh_release_label(r) for r in rels}
+                    self._gh_combo["values"] = list(self._gh_display_to_tag.keys())
+                    if self._gh_force_latest_on_refresh:
+                        self._gh_force_latest_on_refresh = False
+                        self._gh_tag.set(self._gh_tag_to_display.get(self._gh_tags[0], "") if self._gh_tags else "")
+                    elif prev_tag and prev_tag in self._gh_rels:
+                        self._gh_tag.set(self._gh_tag_to_display.get(prev_tag, prev_tag))
+                    elif self._gh_tags:
+                        self._gh_tag.set(self._gh_tag_to_display.get(self._gh_tags[0], self._gh_tags[0]))
+                    else:
+                        self._gh_tag.set("")
+                    self._gh_sync_selection()
+                    suffix = " incl. beta" if self._gh_show_beta.get() else ""
+                    self._gh_status.set(f"GitHub: {len(self._gh_tags)} release(s){suffix}")
 
                 elif kind == "gh_err":
                     self._gh_status.set("GitHub: error")
