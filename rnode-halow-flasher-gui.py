@@ -30,6 +30,7 @@ Requires "modules/" (same as rnode-halow-utils.py):
 from __future__ import annotations
 
 import json
+import ssl
 import struct
 import queue
 import shutil
@@ -57,6 +58,9 @@ from modules.hgic_device import (
     async_sniffer_stop_safe,
     raw_ethernet_access_message,
     sendp_safe,
+    windows_npcap_missing,
+    windows_npcap_missing_message,
+    WINDOWS_NPCAP_URL,
 )
 from modules.hgic_ota import ETH_P_OTA
 from modules.hgic_ota_tar import inspect_ota_tar
@@ -204,11 +208,40 @@ def is_builtin_source(src: str) -> bool:
     return str(src or "").strip() == "builtin"
 
 
+def _build_ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi  # type: ignore
+        cafile = str(certifi.where())
+        if cafile:
+            return ssl.create_default_context(cafile=cafile)
+    except Exception:
+        pass
+    return ssl.create_default_context()
+
+
+def _normalize_network_error(exc: BaseException) -> BaseException:
+    reason = getattr(exc, "reason", None)
+    if isinstance(exc, ssl.SSLCertVerificationError) or isinstance(reason, ssl.SSLCertVerificationError):
+        return RuntimeError(
+            "TLS certificate verification failed for GitHub. "
+            "Install or update the system CA certificates, or install the Python package 'certifi'."
+        )
+    return exc
+
+
+def _urlopen(req, timeout_s: float):
+    import urllib.request
+    try:
+        return urllib.request.urlopen(req, timeout=float(timeout_s), context=_build_ssl_context())
+    except Exception as exc:
+        raise _normalize_network_error(exc) from exc
+
+
 def http_get_json(url: str, timeout_s: float = main_timeout(1.0)) -> Optional[Dict[str, Any]]:
     try:
         import urllib.request
         req = urllib.request.Request(url, headers={"User-Agent": "rnode-halow-gui"})
-        with urllib.request.urlopen(req, timeout=float(timeout_s)) as r:
+        with _urlopen(req, timeout_s) as r:
             data = r.read()
         return json.loads(data.decode("utf-8", errors="replace"))
     except Exception:
@@ -289,7 +322,7 @@ class GhRelease:
 def github_list_release_tags(timeout_s: float = main_timeout(8.0)) -> List[GhRelease]:
     import urllib.request
     req = urllib.request.Request(GITHUB_API_RELEASES, headers={"User-Agent": "rnode-halow-gui"})
-    with urllib.request.urlopen(req, timeout=float(timeout_s)) as r:
+    with _urlopen(req, timeout_s) as r:
         data = r.read()
     obj = json.loads(data.decode("utf-8", errors="replace"))
     if not isinstance(obj, list):
@@ -348,7 +381,7 @@ def github_download(url: str, out_path: Path, progress_cb=None, timeout_s: float
         },
     )
 
-    with urllib.request.urlopen(req, timeout=float(timeout_s)) as r:
+    with _urlopen(req, timeout_s) as r:
         total = int(r.headers.get("Content-Length") or 0)
         done = 0
         t0 = time.time()
@@ -462,9 +495,11 @@ class App(tk.Tk):
         # busy (UI only)
         self._busy = threading.Event()
 
-        # one-shot raw Ethernet access warning
+        # one-shot warnings
         self._raw_ethernet_warning_queued = threading.Event()
         self._raw_ethernet_warning_shown = False
+        self._windows_npcap_warning_queued = threading.Event()
+        self._windows_npcap_warning_shown = False
 
         self._build_ui()
         self._refresh_builtin_fw_list()
@@ -472,6 +507,8 @@ class App(tk.Tk):
 
         # timers/threads
         self.after(60, self._poll_queue)
+        if windows_npcap_missing():
+            self._queue_windows_npcap_warning()
         threading.Thread(target=self._scan_loop, daemon=True).start()
 
         # fetch releases
@@ -615,6 +652,30 @@ class App(tk.Tk):
             messagebox.showwarning("Raw Ethernet access required", msg)
         except Exception:
             pass
+
+    def _queue_windows_npcap_warning(self) -> None:
+        if self._windows_npcap_warning_queued.is_set():
+            return
+        self._windows_npcap_warning_queued.set()
+        self._q.put(("windows_npcap_warning", windows_npcap_missing_message()))
+
+    def _show_windows_npcap_warning_once(self, msg: str) -> None:
+        if self._windows_npcap_warning_shown:
+            return
+        self._windows_npcap_warning_shown = True
+        self._log_line(f"[WARN] {msg.replace(chr(10), ' ')}", "err")
+        try:
+            open_now = messagebox.askyesno(
+                "Npcap required on Windows",
+                msg + "\n\nOpen the Npcap download page now?",
+            )
+            if open_now:
+                webbrowser.open(WINDOWS_NPCAP_URL)
+        except Exception:
+            try:
+                messagebox.showwarning("Npcap required on Windows", msg)
+            except Exception:
+                pass
 
     def _set_progress(self, pct: float, done: int = 0, total: int = 0, speed: float = 0.0) -> None:
         pct = max(0.0, min(100.0, float(pct)))
@@ -1546,6 +1607,9 @@ class App(tk.Tk):
 
                 elif kind == "raw_ethernet_warning":
                     self._show_raw_ethernet_warning_once(str(payload))
+
+                elif kind == "windows_npcap_warning":
+                    self._show_windows_npcap_warning_once(str(payload))
 
                 elif kind == "progress":
                     pct, done, total, speed = payload

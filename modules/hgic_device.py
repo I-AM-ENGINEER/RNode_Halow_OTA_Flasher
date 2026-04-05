@@ -8,6 +8,7 @@ This module is responsible for scapy send/sniff and interface helpers.
 from __future__ import annotations
 
 import errno
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +33,29 @@ _RAW_ETHERNET_ACCESS_MESSAGE = (
 
 def raw_ethernet_access_message() -> str:
     return _RAW_ETHERNET_ACCESS_MESSAGE
+
+
+WINDOWS_NPCAP_URL = "https://npcap.com/#download"
+
+_WINDOWS_NPCAP_MISSING_MESSAGE = (
+    "Npcap is required on Windows.\n\n"
+    "Scapy on Windows needs Npcap to send and receive these Ethernet frames.\n"
+    "Download and install Npcap:\n"
+    f"{WINDOWS_NPCAP_URL}"
+)
+
+
+def windows_npcap_missing() -> bool:
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        return not bool(getattr(conf, "use_pcap", False))
+    except Exception:
+        return True
+
+
+def windows_npcap_missing_message() -> str:
+    return _WINDOWS_NPCAP_MISSING_MESSAGE
 
 
 def _raw_ethernet_access_error(exc: BaseException) -> Optional[RawEthernetAccessError]:
