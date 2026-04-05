@@ -73,6 +73,9 @@ from modules.hgic_ota import ETH_P_OTA
 from modules.hgic_ota_tar import inspect_ota_tar
 
 
+APP_NAME = "RNode-HaLow Flasher"
+APP_VERSION = "1.3.0"
+
 # ----------------------------
 # GitHub repo settings
 # ----------------------------
@@ -537,7 +540,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title("RNode-HaLow Flasher v1.3.0")
+        self.title(f"{APP_NAME} v{APP_VERSION}")
         self.geometry("950x620")
         self.minsize(880, 560)
 
