@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import json
 import os
-import pwd
 import ssl
 import struct
 import subprocess
@@ -49,6 +48,11 @@ from typing import Any, Dict, Optional, Tuple, List, Set
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+try:
+    import pwd  # type: ignore
+except Exception:
+    pwd = None  # type: ignore
 
 from scapy.all import Ether, Raw, AsyncSniffer  # type: ignore
 
@@ -152,10 +156,11 @@ def open_external_url(url: str) -> bool:
                     if value:
                         env_cmd.append(f"{name}={value}")
 
-                try:
-                    env_cmd.append(f"HOME={pwd.getpwnam(sudo_user).pw_dir}")
-                except Exception:
-                    pass
+                if pwd is not None:
+                    try:
+                        env_cmd.append(f"HOME={pwd.getpwnam(sudo_user).pw_dir}")
+                    except Exception:
+                        pass
 
                 if shutil.which("runuser"):
                     cmd = ["runuser", "-u", sudo_user, "--", *env_cmd, *opener]
@@ -606,6 +611,7 @@ class App(tk.Tk):
         self._raw_ethernet_warning_shown = False
         self._windows_npcap_warning_queued = threading.Event()
         self._windows_npcap_warning_shown = False
+        self._startup_notice_shown = False
 
         self._build_ui()
         self._refresh_builtin_fw_list()
@@ -613,6 +619,7 @@ class App(tk.Tk):
 
         # timers/threads
         self.after(60, self._poll_queue)
+        self.after(120, self._show_startup_notice_once)
         if windows_npcap_missing():
             self._queue_windows_npcap_warning()
         threading.Thread(target=self._scan_loop, daemon=True).start()
@@ -788,6 +795,22 @@ class App(tk.Tk):
                 messagebox.showwarning("Npcap required on Windows", msg)
             except Exception:
                 pass
+
+    def _show_startup_notice_once(self) -> None:
+        if self._startup_notice_shown:
+            return
+        self._startup_notice_shown = True
+
+        msg = (
+            "The device being updated must be connected to a network with a DHCP server.\n\n"
+            "If the device cannot obtain an IP address, the firmware update will still complete, "
+            "but the device control panel will not be available."
+        )
+
+        try:
+            messagebox.showwarning("Important information", msg)
+        except Exception:
+            pass
 
     def _set_progress(self, pct: float, done: int = 0, total: int = 0, speed: float = 0.0) -> None:
         pct = max(0.0, min(100.0, float(pct)))
