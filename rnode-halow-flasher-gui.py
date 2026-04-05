@@ -329,7 +329,6 @@ def gh_release_label(rel: GhRelease) -> str:
 
 def github_list_release_tags(
     *,
-    include_prerelease: bool = False,
     timeout_s: float = main_timeout(8.0),
 ) -> List[GhRelease]:
     import urllib.request
@@ -349,8 +348,6 @@ def github_list_release_tags(
             continue
 
         prerelease = bool(rr.get("prerelease"))
-        if prerelease and not include_prerelease:
-            continue
 
         assets: List[GhAsset] = []
         a_raw = rr.get("assets")
@@ -511,6 +508,10 @@ class App(tk.Tk):
         self._gh_status = tk.StringVar(value="GitHub: …")
         self._gh_tags: List[str] = []
         self._gh_rels: Dict[str, GhRelease] = {}
+        self._gh_rels_stable: Dict[str, GhRelease] = {}
+        self._gh_rels_all: Dict[str, GhRelease] = {}
+        self._gh_tags_stable: List[str] = []
+        self._gh_tags_all: List[str] = []
         self._gh_display_to_tag: Dict[str, str] = {}
         self._gh_tag_to_display: Dict[str, str] = {}
         self._gh_force_latest_on_refresh = False
@@ -883,15 +884,43 @@ class App(tk.Tk):
 
     def _gh_refresh_worker(self) -> None:
         try:
-            rels = github_list_release_tags(
-                include_prerelease=bool(self._gh_show_beta.get()),
-                timeout_s=main_timeout(8.0),
-            )
-            self._q.put(("gh_rels", rels))
+            rels_all = github_list_release_tags(timeout_s=main_timeout(8.0))
+            rels_stable = [r for r in rels_all if not r.prerelease]
+            self._q.put(("gh_rels_cache", (rels_stable, rels_all)))
         except Exception as e:
             self._q.put(("gh_err", str(e)))
 
+    def _gh_apply_visible_releases(self, *, force_latest: bool = False) -> None:
+        show_beta = bool(self._gh_show_beta.get())
+        rels_map = self._gh_rels_all if show_beta else self._gh_rels_stable
+        tags = self._gh_tags_all if show_beta else self._gh_tags_stable
+
+        prev_selected = self._gh_tag.get().strip()
+        prev_tag = self._gh_display_to_tag.get(prev_selected, prev_selected)
+
+        self._gh_rels = dict(rels_map)
+        self._gh_tags = list(tags)
+        self._gh_display_to_tag = {gh_release_label(r): r.tag for r in self._gh_rels.values()}
+        self._gh_tag_to_display = {r.tag: gh_release_label(r) for r in self._gh_rels.values()}
+        self._gh_combo["values"] = [self._gh_tag_to_display[t] for t in self._gh_tags]
+
+        if force_latest:
+            self._gh_tag.set(self._gh_tag_to_display.get(self._gh_tags[0], "") if self._gh_tags else "")
+        elif prev_tag and prev_tag in self._gh_rels:
+            self._gh_tag.set(self._gh_tag_to_display.get(prev_tag, prev_tag))
+        elif self._gh_tags:
+            self._gh_tag.set(self._gh_tag_to_display.get(self._gh_tags[0], self._gh_tags[0]))
+        else:
+            self._gh_tag.set("")
+
+        self._gh_sync_selection()
+        suffix = " incl. beta" if show_beta else ""
+        self._gh_status.set(f"GitHub: {len(self._gh_tags)} release(s){suffix}")
+
     def _gh_show_beta_changed(self) -> None:
+        if self._gh_rels_all or self._gh_rels_stable:
+            self._gh_apply_visible_releases(force_latest=True)
+            return
         self._gh_force_latest_on_refresh = True
         self._gh_refresh_async()
 
@@ -1713,27 +1742,15 @@ class App(tk.Tk):
                 elif kind == "busy":
                     self._set_busy(bool(payload))
 
-                elif kind == "gh_rels":
-                    rels: List[GhRelease] = payload
-                    prev_selected = self._gh_tag.get().strip()
-                    prev_tag = self._gh_display_to_tag.get(prev_selected, prev_selected)
-                    self._gh_rels = {r.tag: r for r in rels}
-                    self._gh_tags = [r.tag for r in rels]
-                    self._gh_display_to_tag = {gh_release_label(r): r.tag for r in rels}
-                    self._gh_tag_to_display = {r.tag: gh_release_label(r) for r in rels}
-                    self._gh_combo["values"] = list(self._gh_display_to_tag.keys())
-                    if self._gh_force_latest_on_refresh:
-                        self._gh_force_latest_on_refresh = False
-                        self._gh_tag.set(self._gh_tag_to_display.get(self._gh_tags[0], "") if self._gh_tags else "")
-                    elif prev_tag and prev_tag in self._gh_rels:
-                        self._gh_tag.set(self._gh_tag_to_display.get(prev_tag, prev_tag))
-                    elif self._gh_tags:
-                        self._gh_tag.set(self._gh_tag_to_display.get(self._gh_tags[0], self._gh_tags[0]))
-                    else:
-                        self._gh_tag.set("")
-                    self._gh_sync_selection()
-                    suffix = " incl. beta" if self._gh_show_beta.get() else ""
-                    self._gh_status.set(f"GitHub: {len(self._gh_tags)} release(s){suffix}")
+                elif kind == "gh_rels_cache":
+                    rels_stable, rels_all = payload
+                    self._gh_rels_stable = {r.tag: r for r in rels_stable}
+                    self._gh_rels_all = {r.tag: r for r in rels_all}
+                    self._gh_tags_stable = [r.tag for r in rels_stable]
+                    self._gh_tags_all = [r.tag for r in rels_all]
+                    force_latest = bool(self._gh_force_latest_on_refresh)
+                    self._gh_force_latest_on_refresh = False
+                    self._gh_apply_visible_releases(force_latest=force_latest)
 
                 elif kind == "gh_err":
                     self._gh_status.set("GitHub: error")
