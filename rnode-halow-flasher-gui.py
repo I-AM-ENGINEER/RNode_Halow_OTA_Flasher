@@ -123,61 +123,66 @@ def open_external_url(url: str) -> bool:
 
     if sys.platform.startswith("linux"):
         try:
+            opener: Optional[List[str]] = None
+            if shutil.which("xdg-open"):
+                opener = ["xdg-open", url]
+            elif shutil.which("gio"):
+                opener = ["gio", "open", url]
+
+            if opener is None:
+                return False
+
             if hasattr(os, "geteuid") and (os.geteuid() == 0):
                 sudo_user = str(os.environ.get("SUDO_USER") or "").strip()
-                if sudo_user:
-                    opener: Optional[List[str]] = None
-                    if shutil.which("xdg-open"):
-                        opener = ["xdg-open", url]
-                    elif shutil.which("gio"):
-                        opener = ["gio", "open", url]
+                if not sudo_user:
+                    return False
 
-                    if opener is not None:
-                        env_cmd: List[str] = ["env"]
-                        keep_names = [
-                            "DISPLAY",
-                            "WAYLAND_DISPLAY",
-                            "XAUTHORITY",
-                            "DBUS_SESSION_BUS_ADDRESS",
-                            "XDG_RUNTIME_DIR",
-                            "DESKTOP_SESSION",
-                            "XDG_SESSION_TYPE",
-                        ]
-                        for name in keep_names:
-                            value = str(os.environ.get(name) or "").strip()
-                            if value:
-                                env_cmd.append(f"{name}={value}")
+                env_cmd: List[str] = ["env"]
+                keep_names = [
+                    "DISPLAY",
+                    "WAYLAND_DISPLAY",
+                    "XAUTHORITY",
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "XDG_RUNTIME_DIR",
+                    "DESKTOP_SESSION",
+                    "XDG_SESSION_TYPE",
+                ]
+                for name in keep_names:
+                    value = str(os.environ.get(name) or "").strip()
+                    if value:
+                        env_cmd.append(f"{name}={value}")
 
-                        try:
-                            env_cmd.append(f"HOME={pwd.getpwnam(sudo_user).pw_dir}")
-                        except Exception:
-                            pass
+                try:
+                    env_cmd.append(f"HOME={pwd.getpwnam(sudo_user).pw_dir}")
+                except Exception:
+                    pass
 
-                        if shutil.which("runuser"):
-                            cmd = ["runuser", "-u", sudo_user, "--", *env_cmd, *opener]
-                            res = subprocess.run(
-                                cmd,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                check=False,
-                                timeout=10.0,
-                            )
-                            if int(res.returncode) == 0:
-                                return True
+                if shutil.which("runuser"):
+                    cmd = ["runuser", "-u", sudo_user, "--", *env_cmd, *opener]
+                elif shutil.which("sudo"):
+                    cmd = ["sudo", "-u", sudo_user, *env_cmd, *opener]
+                else:
+                    return False
 
-                        if shutil.which("sudo"):
-                            cmd = ["sudo", "-u", sudo_user, *env_cmd, *opener]
-                            res = subprocess.run(
-                                cmd,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                check=False,
-                                timeout=10.0,
-                            )
-                            if int(res.returncode) == 0:
-                                return True
+                res = subprocess.run(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=10.0,
+                )
+                return int(res.returncode) == 0
+
+            res = subprocess.run(
+                opener,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10.0,
+            )
+            return int(res.returncode) == 0
         except Exception:
-            pass
+            return False
 
     try:
         return bool(webbrowser.open(url))
@@ -1120,12 +1125,7 @@ class App(tk.Tk):
         if not ip:
             self._log_line("[!] no IP for selected device", "err")
             return
-        if not open_external_url(f"http://{ip}/"):
-            self._log_line("[ERR] failed to open browser", "err")
-            try:
-                messagebox.showwarning("Open browser failed", "Could not open the browser for the selected device.")
-            except Exception:
-                pass
+        open_external_url(f"http://{ip}/")
 
     # ---------- Scanning / IP polling ----------
 
