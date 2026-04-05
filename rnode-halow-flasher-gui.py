@@ -30,8 +30,11 @@ Requires "modules/" (same as rnode-halow-utils.py):
 from __future__ import annotations
 
 import json
+import os
+import pwd
 import ssl
 import struct
+import subprocess
 import queue
 import shutil
 import sys
@@ -112,6 +115,74 @@ def parse_format_littlefs_resp_payload(b: bytes) -> Optional[int]:
     if b[0] != int(ETH_P_OTA_FW_FORMAT_LITTLEFS_RESP):
         return None
     return int(b[1])
+
+
+def open_external_url(url: str) -> bool:
+    if not url:
+        return False
+
+    if sys.platform.startswith("linux"):
+        try:
+            if hasattr(os, "geteuid") and (os.geteuid() == 0):
+                sudo_user = str(os.environ.get("SUDO_USER") or "").strip()
+                if sudo_user:
+                    opener: Optional[List[str]] = None
+                    if shutil.which("xdg-open"):
+                        opener = ["xdg-open", url]
+                    elif shutil.which("gio"):
+                        opener = ["gio", "open", url]
+
+                    if opener is not None:
+                        env_cmd: List[str] = ["env"]
+                        keep_names = [
+                            "DISPLAY",
+                            "WAYLAND_DISPLAY",
+                            "XAUTHORITY",
+                            "DBUS_SESSION_BUS_ADDRESS",
+                            "XDG_RUNTIME_DIR",
+                            "DESKTOP_SESSION",
+                            "XDG_SESSION_TYPE",
+                        ]
+                        for name in keep_names:
+                            value = str(os.environ.get(name) or "").strip()
+                            if value:
+                                env_cmd.append(f"{name}={value}")
+
+                        try:
+                            env_cmd.append(f"HOME={pwd.getpwnam(sudo_user).pw_dir}")
+                        except Exception:
+                            pass
+
+                        if shutil.which("runuser"):
+                            cmd = ["runuser", "-u", sudo_user, "--", *env_cmd, *opener]
+                            res = subprocess.run(
+                                cmd,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                                timeout=10.0,
+                            )
+                            if int(res.returncode) == 0:
+                                return True
+
+                        if shutil.which("sudo"):
+                            cmd = ["sudo", "-u", sudo_user, *env_cmd, *opener]
+                            res = subprocess.run(
+                                cmd,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                                timeout=10.0,
+                            )
+                            if int(res.returncode) == 0:
+                                return True
+        except Exception:
+            pass
+
+    try:
+        return bool(webbrowser.open(url))
+    except Exception:
+        return False
 
 
 # ----------------------------
@@ -555,7 +626,7 @@ class App(tk.Tk):
         fw_top = ttk.Frame(fw)
         fw_top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(6, 2))
 
-        ttk.Button(fw_top, text="GitHub", command=lambda: webbrowser.open(REPO_URL)).pack(side=tk.RIGHT)
+        ttk.Button(fw_top, text="GitHub", command=lambda: open_external_url(REPO_URL)).pack(side=tk.RIGHT)
 
         ttk.Radiobutton(
             fw_top, text="GitHub release:", value="github", variable=self._fw_source,
@@ -706,7 +777,7 @@ class App(tk.Tk):
                 msg + "\n\nOpen the Npcap download page now?",
             )
             if open_now:
-                webbrowser.open(WINDOWS_NPCAP_URL)
+                open_external_url(WINDOWS_NPCAP_URL)
         except Exception:
             try:
                 messagebox.showwarning("Npcap required on Windows", msg)
@@ -1049,7 +1120,12 @@ class App(tk.Tk):
         if not ip:
             self._log_line("[!] no IP for selected device", "err")
             return
-        webbrowser.open(f"http://{ip}/")
+        if not open_external_url(f"http://{ip}/"):
+            self._log_line("[ERR] failed to open browser", "err")
+            try:
+                messagebox.showwarning("Open browser failed", "Could not open the browser for the selected device.")
+            except Exception:
+                pass
 
     # ---------- Scanning / IP polling ----------
 
