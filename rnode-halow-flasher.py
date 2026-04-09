@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-"""Compatibility wrapper for the new shared CLI entrypoint."""
-
 from app.cli import main
 
 
