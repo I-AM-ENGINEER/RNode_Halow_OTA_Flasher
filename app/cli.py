@@ -11,6 +11,8 @@ from .github import GhRelease, github_download, github_pick_asset
 from .models import DeviceRow, FirmwareSelection, ServiceEvent
 from .service import FlasherService
 
+RAW_ETHERNET_COMMANDS = {"scan", "update", "raw-flash", "get-ip", "reboot", "open-web"}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rnode-halow-flasher")
@@ -81,6 +83,8 @@ def main(
     service = service or FlasherService()
 
     try:
+        if getattr(args, "command", "") in RAW_ETHERNET_COMMANDS:
+            _emit_environment_warnings(service, stderr)
         if args.command == "scan":
             return _cmd_scan(service, args, stdout)
         if args.command == "releases":
@@ -109,6 +113,11 @@ def main(
 
     print(f"unknown command: {args.command}", file=stderr)
     return 2
+
+
+def _emit_environment_warnings(service: Any, stderr: TextIO) -> None:
+    for message in list(getattr(service, "validate_environment", lambda: [])() or []):
+        print(message, file=stderr)
 
 
 def _cmd_scan(service: Any, args: Any, stdout: TextIO) -> int:

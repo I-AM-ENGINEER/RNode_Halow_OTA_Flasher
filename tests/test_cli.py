@@ -115,6 +115,36 @@ class CliTests(unittest.TestCase):
         payload = json.loads(out.getvalue())
         self.assertEqual(payload["releases"][0]["tag"], "v1.2.3")
         self.assertEqual(payload["releases"][0]["selected_asset"]["name"], "firmware.tar")
+        self.assertNotIn(("validate_environment",), service.calls)
+
+    def test_scan_prints_environment_warning_before_running(self) -> None:
+        out = io.StringIO()
+        err = io.StringIO()
+        service = FakeService()
+        service.environment_messages = ["Npcap is required on Windows."]
+
+        exit_code = main(["scan"], service=service, stdout=out, stderr=err)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn(("validate_environment",), service.calls)
+        self.assertIn("Npcap is required on Windows.", err.getvalue())
+
+    def test_update_prints_environment_warning_before_running(self) -> None:
+        out = io.StringIO()
+        err = io.StringIO()
+        service = FakeService()
+        service.environment_messages = ["Raw Ethernet may require sudo or CAP_NET_RAW."]
+
+        exit_code = main(
+            ["update", "--mac", "aa:aa:aa:aa:aa:aa", "--file", "/tmp/fw.tar"],
+            service=service,
+            stdout=out,
+            stderr=err,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn(("validate_environment",), service.calls)
+        self.assertIn("Raw Ethernet may require sudo or CAP_NET_RAW.", err.getvalue())
 
     def test_update_ambiguous_target_returns_error(self) -> None:
         out = io.StringIO()
