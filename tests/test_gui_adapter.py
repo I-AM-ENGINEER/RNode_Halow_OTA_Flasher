@@ -88,11 +88,11 @@ class GuiAdapterTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.gui = _load_gui_module()
 
-    def test_should_require_preflash_only_for_non_rnode(self) -> None:
-        self.assertFalse(self.gui.should_require_preflash("rnode-halow", "github"))
-        self.assertTrue(self.gui.should_require_preflash("hgic", "github"))
+    def test_should_require_preflash_for_ota_updates(self) -> None:
+        self.assertTrue(self.gui.should_require_preflash("ota"))
+        self.assertFalse(self.gui.should_require_preflash("bin"))
 
-    def test_flash_selected_does_not_require_preflash_for_rnode(self) -> None:
+    def test_flash_selected_requires_preflash_for_rnode_ota(self) -> None:
         app = self.gui.App.__new__(self.gui.App)
         app._busy = threading.Event()
         app._set_busy = lambda *_args, **_kwargs: None
@@ -120,10 +120,10 @@ class GuiAdapterTests(unittest.TestCase):
              patch.object(self.gui.threading, "Thread", return_value=thread):
             app._flash_selected()
 
-        showerror.assert_not_called()
-        thread.start.assert_called_once()
+        showerror.assert_called_once()
+        thread.start.assert_not_called()
 
-    def test_device_changed_renames_row_and_device_ip_targets_new_key(self) -> None:
+    def test_device_changed_only_logs_and_device_ip_keeps_current_key(self) -> None:
         app = self.gui.App.__new__(self.gui.App)
         app._q = queue.Queue()
         app._rows = {}
@@ -153,12 +153,11 @@ class GuiAdapterTests(unittest.TestCase):
             ),
         )
 
-        queued = [app._q.get_nowait(), app._q.get_nowait(), app._q.get_nowait()]
+        queued = [app._q.get_nowait(), app._q.get_nowait()]
 
-        self.assertEqual(queued[0][0], "devkey")
-        self.assertEqual(queued[0][1], (("aa:aa:aa:aa:aa:aa", "if0"), ("bb:bb:bb:bb:bb:bb", "if0")))
+        self.assertEqual(queued[0][0], "log")
         self.assertEqual(queued[-1][0], "devinfo")
-        self.assertEqual(queued[-1][1][0], ("bb:bb:bb:bb:bb:bb", "if0"))
+        self.assertEqual(queued[-1][1][0], ("aa:aa:aa:aa:aa:aa", "if0"))
 
 
 if __name__ == "__main__":

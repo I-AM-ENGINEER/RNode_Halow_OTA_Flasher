@@ -185,6 +185,41 @@ class FlasherServiceTests(unittest.TestCase):
         self.assertEqual(format_calls, ["bb:bb:bb:bb:bb:bb"])
         self.assertEqual(session.flash_fs_calls[0][0], "bb:bb:bb:bb:bb:bb")
 
+    def test_update_device_preflashes_even_for_rnode_halow_target(self) -> None:
+        session = FakeSession(
+            "if0",
+            ip_results=[
+                FakeIpInfo(ip="192.168.1.40"),
+                FakeIpInfo(ip="192.168.1.41"),
+            ],
+        )
+        scan_sequences = [
+            [FakeScanDevice("aa:aa:aa:aa:aa:aa", "eth0", "if0", "0.0.0.0")],
+            [FakeScanDevice("aa:aa:aa:aa:aa:aa", "eth0", "if0", "0.0.0.0")],
+        ]
+
+        def fake_scan_iface(*_args, **_kwargs):
+            if scan_sequences:
+                return scan_sequences.pop(0)
+            return []
+
+        service = FlasherService(
+            scan_iface=fake_scan_iface,
+            session_factory=lambda iface: session,
+            inspect_ota_tar=lambda _path: FakeTarInfo(has_www_dir=True),
+            read_builtin_firmware=lambda _name: b"preflash-bytes",
+            pick_preflash_firmware_name=lambda: "preflash.bin",
+            format_littlefs=lambda _session, _mac: None,
+            sleep=lambda _value: None,
+        )
+        target = DeviceRow(mac="aa:aa:aa:aa:aa:aa", iface="eth0", iface_id="if0", kind="rnode-halow")
+        firmware = FirmwareSelection(source="local", mode="ota", path=Path("/tmp/fw.tar"), label="fw.tar")
+
+        events = list(service.update_device(target, firmware, known_rows=[target]))
+
+        self.assertEqual(events[0].message, "flash original firmware")
+        self.assertEqual(session.flash_calls[0][1], b"preflash-bytes")
+
 
 if __name__ == "__main__":
     unittest.main()

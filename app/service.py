@@ -394,27 +394,26 @@ class FlasherService:
         info = self._inspect_ota_tar(Path(firmware.path or ""))
         progress_cb, retry_cb = self._build_progress_callbacks(emit)
 
-        if target.kind != "rnode-halow":
-            preflash_name = self._pick_preflash_firmware_name()
-            emit(self.event("stage", "flash original firmware"))
-            session.flash(
-                state.current_mac,
-                self._read_builtin_firmware(preflash_name),
-                timeout=main_timeout(5.45),
-                retries=5,
-                progress_cb=progress_cb,
-                retry_cb=retry_cb,
-            )
-            emit(self.event("stage", "reboot original firmware"))
-            session.reboot(state.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-            emit(self.event("stage", "waiting original firmware reboot..."))
-            ready, ready_events = self.wait_hgic_ready(state, overall_timeout_s=main_timeout(15.0))
-            for event in ready_events:
-                emit(event)
-            if not ready:
-                raise RuntimeError("original firmware did not return as HGIC within 15 seconds")
-            emit(self.event("stage", "waiting original firmware settle..."))
-            self._sleep(main_timeout(5.0))
+        preflash_name = self._pick_preflash_firmware_name()
+        emit(self.event("stage", "flash original firmware"))
+        session.flash(
+            state.current_mac,
+            self._read_builtin_firmware(preflash_name),
+            timeout=main_timeout(5.45),
+            retries=5,
+            progress_cb=progress_cb,
+            retry_cb=retry_cb,
+        )
+        emit(self.event("stage", "reboot original firmware"))
+        session.reboot(state.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
+        emit(self.event("stage", "waiting original firmware reboot..."))
+        ready, ready_events = self.wait_hgic_ready(state, overall_timeout_s=main_timeout(15.0))
+        for event in ready_events:
+            emit(event)
+        if not ready:
+            raise RuntimeError("original firmware did not return as HGIC within 15 seconds")
+        emit(self.event("stage", "waiting original firmware settle..."))
+        self._sleep(main_timeout(5.0))
 
         emit(self.event("stage", "flash rnode-halow firmware"))
         session.flash(

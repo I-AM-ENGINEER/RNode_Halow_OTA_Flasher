@@ -14,7 +14,7 @@ from app.cli import build_parser, main
 class FakeService:
     def __init__(self) -> None:
         self.rows = [
-            DeviceRow(mac="aa:aa:aa:aa:aa:aa", iface="eth0", iface_id="if0", kind="hgic"),
+            DeviceRow(mac="aa:aa:aa:aa:aa:aa", iface="eth0", iface_id="if0", kind="rnode-halow"),
         ]
         self.releases = [
             GhRelease(
@@ -57,12 +57,25 @@ class FakeService:
         return self.releases
 
     def update_device(self, target, firmware, *, known_rows):
-        self.calls.append(("update_device", target.mac, firmware.source, firmware.mode, firmware.path, firmware.github_tag))
-        return [ServiceEvent(kind="done", message="flash done")]
+        events = []
+        self.run_update_device(target, firmware, known_rows=known_rows, emit=events.append)
+        return events
 
     def raw_flash(self, target, firmware, *, known_rows):
-        self.calls.append(("raw_flash", target.mac, firmware.mode, firmware.path))
-        return [ServiceEvent(kind="done", message="RAW flash done")]
+        events = []
+        self.run_raw_flash(target, firmware, known_rows=known_rows, emit=events.append)
+        return events
+
+    def run_update_device(self, target, firmware, *, known_rows, emit):
+        self.calls.append(("run_update_device", target.mac, firmware.source, firmware.mode, firmware.path, firmware.github_tag))
+        emit(ServiceEvent(kind="stage", message="flash rnode-halow firmware"))
+        emit(ServiceEvent(kind="progress", data={"pct": 50.0, "done": 50, "total": 100, "speed": 1024.0}))
+        emit(ServiceEvent(kind="done", message="flash done"))
+
+    def run_raw_flash(self, target, firmware, *, known_rows, emit):
+        self.calls.append(("run_raw_flash", target.mac, firmware.mode, firmware.path))
+        emit(ServiceEvent(kind="stage", message="RAW flash"))
+        emit(ServiceEvent(kind="done", message="RAW flash done"))
 
     def get_ip(self, target):
         self.calls.append(("get_ip", target.mac))
@@ -71,6 +84,10 @@ class FakeService:
     def reboot_device(self, target, *, known_rows):
         self.calls.append(("reboot_device", target.mac))
         return [ServiceEvent(kind="done", message="reboot sent")]
+
+    def run_reboot(self, target, *, known_rows, emit):
+        self.calls.append(("run_reboot", target.mac))
+        emit(ServiceEvent(kind="done", message="reboot sent"))
 
     def open_web(self, target):
         self.calls.append(("open_web", target.mac))
@@ -103,6 +120,7 @@ class CliTests(unittest.TestCase):
         payload = json.loads(out.getvalue())
         self.assertEqual(payload["devices"][0]["mac"], "aa:aa:aa:aa:aa:aa")
         self.assertEqual(payload["devices"][0]["iface_id"], "if0")
+        self.assertEqual(payload["devices"][0]["ip"], "192.168.1.55")
 
     def test_releases_json_outputs_selected_asset(self) -> None:
         out = io.StringIO()
@@ -162,11 +180,28 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(exit_code, 0)
         self.assertIn("ambiguous target", err.getvalue())
 
+    def test_update_streams_events_via_run_update_device(self) -> None:
+        out = io.StringIO()
+        err = io.StringIO()
+        service = FakeService()
+
+        exit_code = main(
+            ["update", "--mac", "aa:aa:aa:aa:aa:aa", "--file", "/tmp/fw.tar"],
+            service=service,
+            stdout=out,
+            stderr=err,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn(("run_update_device", "aa:aa:aa:aa:aa:aa", "local", "ota", Path("/tmp/fw.tar"), ""), service.calls)
+        self.assertIn("[*] flash rnode-halow firmware", out.getvalue())
+        self.assertIn("[OK] flash done", out.getvalue())
+
     def test_wizard_dispatches_list_releases(self) -> None:
         out = io.StringIO()
         err = io.StringIO()
         service = FakeService()
-        answers = iter(["1", "5", "0", "0"])
+        answers = iter(["1", "4", "0", "0"])
 
         exit_code = main(
             ["wizard"],
@@ -184,7 +219,7 @@ class CliTests(unittest.TestCase):
         out = io.StringIO()
         err = io.StringIO()
         service = FakeService()
-        answers = iter(["1", "1", "1", "", ""])
+        answers = iter(["1", "1", "1", "", "", "0"])
 
         with patch("app.cli.github_download") as github_download:
             exit_code = main(
@@ -199,7 +234,7 @@ class CliTests(unittest.TestCase):
         github_download.assert_called_once()
         self.assertIn(("list_releases", True), service.calls)
         self.assertIn(
-            ("update_device", "aa:aa:aa:aa:aa:aa", "github", "ota", unittest.mock.ANY, "v1.2.3"),
+            ("run_update_device", "aa:aa:aa:aa:aa:aa", "github", "ota", unittest.mock.ANY, "v1.2.3"),
             service.calls,
         )
 
@@ -207,7 +242,7 @@ class CliTests(unittest.TestCase):
         out = io.StringIO()
         err = io.StringIO()
         service = FakeService()
-        answers = iter(["1", "2", "1", "2", ""])
+        answers = iter(["1", "2", "1", "2", "", "0"])
 
         with patch("app.cli.github_download") as github_download:
             exit_code = main(
@@ -222,7 +257,7 @@ class CliTests(unittest.TestCase):
         github_download.assert_called_once()
         self.assertIn(("list_releases", True), service.calls)
         self.assertIn(
-            ("raw_flash", "aa:aa:aa:aa:aa:aa", "bin", unittest.mock.ANY),
+            ("run_raw_flash", "aa:aa:aa:aa:aa:aa", "bin", unittest.mock.ANY),
             service.calls,
         )
 
@@ -230,7 +265,7 @@ class CliTests(unittest.TestCase):
         out = io.StringIO()
         err = io.StringIO()
         service = FakeService()
-        answers = iter(["1", "0", "1", "4"])
+        answers = iter(["1", "0", "1", "3", "0"])
 
         exit_code = main(
             ["wizard"],
@@ -242,13 +277,13 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertGreaterEqual(out.getvalue().count("Devices:"), 2)
-        self.assertIn(("reboot_device", "aa:aa:aa:aa:aa:aa"), service.calls)
+        self.assertIn(("run_reboot", "aa:aa:aa:aa:aa:aa"), service.calls)
 
     def test_wizard_zero_on_release_goes_back_to_source_choice(self) -> None:
         out = io.StringIO()
         err = io.StringIO()
         service = FakeService()
-        answers = iter(["1", "1", "1", "0", "2", "/tmp/fw.tar", ""])
+        answers = iter(["1", "1", "1", "0", "2", "/tmp/fw.tar", "", "0"])
 
         with patch("app.cli.github_download") as github_download:
             exit_code = main(
@@ -263,7 +298,7 @@ class CliTests(unittest.TestCase):
         github_download.assert_not_called()
         self.assertIn("GitHub releases:", out.getvalue())
         self.assertIn(
-            ("update_device", "aa:aa:aa:aa:aa:aa", "local", "ota", Path("/tmp/fw.tar"), ""),
+            ("run_update_device", "aa:aa:aa:aa:aa:aa", "local", "ota", Path("/tmp/fw.tar"), ""),
             service.calls,
         )
 
@@ -272,7 +307,7 @@ class CliTests(unittest.TestCase):
         err = io.StringIO()
         service = FakeService()
         service.environment_messages = ["Raw Ethernet may require sudo or CAP_NET_RAW."]
-        answers = iter(["1", "1", "2", "/tmp/fw.tar", ""])
+        answers = iter(["1", "1", "2", "/tmp/fw.tar", "", "0"])
 
         def ask(prompt: str) -> str:
             out.write(prompt)
@@ -300,7 +335,7 @@ class CliTests(unittest.TestCase):
         out = io.StringIO()
         err = io.StringIO()
         service = FakeService()
-        answers = iter(["1", "2", "2", "/tmp/fw.bin", "0", "2", "/tmp/fw.bin", ""])
+        answers = iter(["1", "2", "2", "/tmp/fw.bin", "0", "2", "/tmp/fw.bin", "", "0"])
 
         def ask(prompt: str) -> str:
             out.write(prompt)
@@ -318,7 +353,46 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(out.getvalue().count("Summary:"), 2)
-        self.assertIn(("raw_flash", "aa:aa:aa:aa:aa:aa", "bin", Path("/tmp/fw.bin")), service.calls)
+        self.assertIn(("run_raw_flash", "aa:aa:aa:aa:aa:aa", "bin", Path("/tmp/fw.bin")), service.calls)
+
+    def test_wizard_empty_input_reprompts_instead_of_exiting(self) -> None:
+        out = io.StringIO()
+        err = io.StringIO()
+        service = FakeService()
+        answers = iter(["", "1", "0", "0"])
+
+        def ask(_prompt: str) -> str:
+            return next(answers)
+
+        exit_code = main(
+            ["wizard"],
+            service=service,
+            stdout=out,
+            stderr=err,
+            input_fn=ask,
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Invalid input", err.getvalue())
+        self.assertGreaterEqual(out.getvalue().count("Devices:"), 2)
+
+    def test_wizard_continues_after_command_completion(self) -> None:
+        out = io.StringIO()
+        err = io.StringIO()
+        service = FakeService()
+        answers = iter(["1", "3", "0", "0"])
+
+        exit_code = main(
+            ["wizard"],
+            service=service,
+            stdout=out,
+            stderr=err,
+            input_fn=lambda _prompt: next(answers),
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn(("run_reboot", "aa:aa:aa:aa:aa:aa"), service.calls)
+        self.assertGreaterEqual(out.getvalue().count("Devices:"), 2)
 
     def test_legacy_utils_wrapper_exposes_new_cli_help(self) -> None:
         proc = subprocess.run(

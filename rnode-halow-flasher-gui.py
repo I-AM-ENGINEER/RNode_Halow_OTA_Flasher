@@ -118,10 +118,8 @@ def is_rnode_halow_by_scan(ver: str) -> bool:
     return (ver or "").strip() == "0.0.0.0"
 
 
-def should_require_preflash(target_kind: str, firmware_source: str) -> bool:
-    if str(target_kind or "").strip() == "rnode-halow":
-        return False
-    return not is_builtin_source(firmware_source)
+def should_require_preflash(firmware_mode: str) -> bool:
+    return str(firmware_mode or "").strip() == "ota"
 
 
 # ----------------------------
@@ -840,15 +838,10 @@ class App(tk.Tk):
             )
             return
         if kind == "device_changed":
-            old_mac = str(data.get("old_mac") or row.mac or "").lower()
-            new_mac = str(data.get("new_mac") or "").lower()
-            if new_mac and new_mac != old_mac:
-                self._q.put(("devkey", ((old_mac, row.iface_id), (new_mac, row.iface_id))))
             self._q.put(("log", ("[*] " + message, "stage")))
             return
         if kind == "device_ip":
-            mac = str(data.get("mac") or row.mac or "").lower()
-            self._q.put(("devinfo", ((mac, row.iface_id), str(data.get("ip") or message or ""), "")))
+            self._q.put(("devinfo", (row.key(), str(data.get("ip") or message or ""), "")))
             return
         if kind == "done":
             self._q.put(("log", ("[OK] " + message, "ok")))
@@ -973,7 +966,7 @@ class App(tk.Tk):
             messagebox.showerror("No firmware", "Select a firmware first.")
             return
 
-        needs_preflash = should_require_preflash(getattr(r, "kind", ""), fw.source)
+        needs_preflash = should_require_preflash(fw.mode)
         if needs_preflash:
             try:
                 pick_preflash_firmware_name()
@@ -1094,34 +1087,6 @@ class App(tk.Tk):
         else:
             self._tree_items[key] = self._tree.insert("", tk.END, values=vals)
 
-    def _rename_row_key(self, old_key: Tuple[str, str], new_key: Tuple[str, str]) -> None:
-        if old_key == new_key:
-            return
-
-        row = self._rows.pop(old_key, None)
-        if row is None:
-            return
-
-        row.mac = str(new_key[0] or row.mac)
-        row.iface_id = str(new_key[1] or row.iface_id)
-        self._rows[new_key] = row
-
-        item_id = self._tree_items.pop(old_key, None)
-        if item_id is not None:
-            self._tree_items[new_key] = item_id
-            try:
-                self._tree.item(item_id, values=self._row_values(row))
-            except Exception:
-                pass
-
-        if old_key in self._ip_poll_last:
-            self._ip_poll_last[new_key] = self._ip_poll_last.pop(old_key)
-        if old_key in self._ip_jobs_inflight:
-            self._ip_jobs_inflight.discard(old_key)
-            self._ip_jobs_inflight.add(new_key)
-        if self._selected_key == old_key:
-            self._selected_key = new_key
-
     def _remove_row(self, key: Tuple[str, str]) -> None:
         iid = self._tree_items.pop(key, None)
         if iid:
@@ -1164,11 +1129,6 @@ class App(tk.Tk):
                             r.ver = ver_s
                         self._upsert_row(r)
                         self._refresh_buttons()
-
-                elif kind == "devkey":
-                    old_key, new_key = payload
-                    self._rename_row_key(tuple(old_key), tuple(new_key))
-                    self._refresh_buttons()
 
                 elif kind == "log":
                     s, tag = payload
