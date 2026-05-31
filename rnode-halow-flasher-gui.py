@@ -805,8 +805,8 @@ class App(tk.Tk):
         self._startup_notice_shown = True
 
         msg = (
-            "Please note on updating the existing custom firmware:\n\n"
             "The device being updated must be connected to a network with a DHCP server.\n\n"
+            "Default firmware (hgic) does not obtain IP address, only custom firmware\n\n"
             "If the device cannot obtain an IP address, the firmware update will still complete, "
             "but the device control panel will not be available."
         )
