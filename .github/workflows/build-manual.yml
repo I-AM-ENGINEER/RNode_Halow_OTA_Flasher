@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       python_version:
-        description: "Python version for the build"
+        description: "Python version for the Windows build"
         required: false
         default: "3.13"
         type: string
@@ -66,58 +66,88 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
-            os_name: linux
-          - runner: windows-latest
-            os_name: windows
+          - os_name: linux
+          - os_name: windows
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os_name == 'linux' && 'ubuntu-latest' || 'windows-latest' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # ==================================================================
+      # Linux: build inside a Debian 11 (bullseye) container so the
+      # resulting binary is linked against glibc 2.31. This makes it run
+      # on every modern desktop distro (Debian 11+, Ubuntu 21+, Fedora
+      # 33+, Mint 20.3+, Arch, ...). The job itself stays on the hosted
+      # ubuntu-latest runner, so checkout + gh work normally.
+      # ==================================================================
+      - name: Build on Linux (Debian 11 / glibc 2.31)
+        if: matrix.os_name == 'linux'
+        env:
+          VERSION: ${{ needs.prepare_release.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD":/src -w /src -e VERSION="$VERSION" debian:bullseye-slim bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+
+            echo "[*] Installing build deps (python3 + tk/tcl + X11)..."
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              ca-certificates \
+              python3 python3-venv python3-pip python3-tk \
+              libtcl8.6 libtk8.6 \
+              libx11-6 libxft2 libxss1 libxrender1 libxext6 \
+              libxi6 libxrandr2 libxcursor1 libxinerama1 libxfixes3 \
+              libglib2.0-0 libfontconfig1 libfreetype6 libpng16-16
+
+            echo "[*] Injecting application version..."
+            python3 tools/set_version.py "$VERSION"
+
+            echo "[*] Building..."
+            chmod +x build_linux.sh
+            ./build_linux.sh
+          '
+
+      - name: Fix ownership of build outputs
+        if: matrix.os_name == 'linux'
+        run: sudo chown -R "$(id -u):$(id -g)" dist build .venv || true
+
+      # ==================================================================
+      # Windows: unchanged, uses the hosted windows-latest runner.
+      # ==================================================================
       - name: Set up Python
+        if: matrix.os_name == 'windows'
         uses: actions/setup-python@v6
         with:
           python-version: ${{ inputs.python_version }}
           cache: pip
 
-      - name: Install Python dependencies
+      - name: Install Python dependencies (Windows)
+        if: matrix.os_name == 'windows'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-tk
-
-      - name: Inject application version
+      - name: Inject application version (Windows)
+        if: matrix.os_name == 'windows'
         run: python tools/set_version.py "${{ needs.prepare_release.outputs.version }}"
 
-      - name: Build on Linux
-        if: runner.os == 'Linux'
-        run: |
-          chmod +x build_linux.sh
-          ./build_linux.sh
-
       - name: Build on Windows
-        if: runner.os == 'Windows'
+        if: matrix.os_name == 'windows'
         run: build_win.bat
         shell: cmd
 
       - name: Package Linux artifact
-        if: runner.os == 'Linux'
+        if: matrix.os_name == 'linux'
         shell: bash
         run: |
           mkdir -p release
           tar -C dist -czf "release/RNode-HaLow-Flasher-${{ needs.prepare_release.outputs.version }}-linux.tar.gz" .
 
       - name: Package Windows artifact
-        if: runner.os == 'Windows'
+        if: matrix.os_name == 'windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
