@@ -29,9 +29,12 @@ mkdir -p embedded_fw
 PYTHON_BIN="python3"
 
 # --- create venv (once) ---
+# --system-site-packages: ensures tkinter (provided by python3-tk into
+# dist-packages on Debian/Ubuntu) is importable inside the venv, so that
+# PyInstaller can bundle it for the GUI.
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
   echo "[*] Creating venv: $VENV_DIR"
-  "$PYTHON_BIN" -m venv "$VENV_DIR"
+  "$PYTHON_BIN" -m venv --system-site-packages "$VENV_DIR"
 fi
 
 VPY="$VENV_DIR/bin/python"
