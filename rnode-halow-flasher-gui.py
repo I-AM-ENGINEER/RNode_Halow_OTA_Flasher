@@ -74,7 +74,7 @@ from modules.hgic_ota_tar import inspect_ota_tar
 
 
 APP_NAME = "RNode-HaLow Flasher"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.2"
 
 # ----------------------------
 # GitHub repo settings

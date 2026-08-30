@@ -141,7 +141,10 @@ class HgicSession:
                     dst_mac,
                     payload,
                     timeout=float(timeout),
-                    retries=1,
+                    # Per-chunk retransmissions: a single lost ACK must not
+                    # abort the whole transfer. The outer attempt loop stays
+                    # as a last resort.
+                    retries=5,
                     progress_cb=progress_cb,
                 )
                 return
