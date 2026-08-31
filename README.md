@@ -36,12 +36,104 @@ Recommended to disassemble one of the devices and make a dump of the SPI flash. 
 1) Download [Download repo from GitHub](https://github.com/I-AM-ENGINEER/RNode_Halow_OTA_Flasher/archive/refs/heads/main.zip)
 2) Unpack and run `build_win.bat`
 
-Result will be in dist folder
+Result will be in `dist` folder:
+
+- `rnode-halow-flasher-gui.exe` - GUI application
+- `rnode-halow-flasher.exe` - CLI application
 
 #### Linux
 
 1) Clone repo: `git clone https://github.com/I-AM-ENGINEER/RNode_Halow_OTA_Flasher && cd RNode_Halow_OTA_Flasher`
-2) Add execulable flag: `chmod +x build_linux.sh`
-3) Start build process: `build_linux.sh`
+2) Add executable flag: `chmod +x build_linux.sh`
+3) Start build process: `./build_linux.sh`
 
-Result will be in dist folder
+Result will be in `dist` folder:
+
+- `rnode-halow-flasher-gui` - GUI application
+- `rnode-halow-flasher` - CLI application
+
+## CLI
+
+The project now includes a CLI entrypoint.
+
+From source:
+
+```bash
+python rnode-halow-flasher.py --help
+```
+
+From packaged builds on Linux:
+
+```bash
+./dist/rnode-halow-flasher --help
+```
+
+From packaged builds on Windows:
+
+```bat
+dist\rnode-halow-flasher.exe --help
+```
+
+### Wizard
+
+Use the guided terminal flow when you want the tool to walk you through device
+selection and action choice:
+
+```bash
+python rnode-halow-flasher.py wizard
+```
+
+When using packaged builds from `dist`, run:
+
+```bash
+./dist/rnode-halow-flasher wizard
+```
+
+Wizard behavior:
+
+- `0` goes back to the previous step
+- on device selection, `0` exits the wizard
+- in the GitHub branch, `Enter` selects the latest stable release
+- before `update` and `raw-flash`, the wizard can show an environment notice and always shows a confirmation summary before starting
+
+### Non-interactive commands
+
+Scan for devices:
+
+```bash
+python rnode-halow-flasher.py scan
+python rnode-halow-flasher.py scan --json
+```
+
+List GitHub releases and the asset each release would use:
+
+```bash
+python rnode-halow-flasher.py releases
+python rnode-halow-flasher.py releases --json
+```
+
+`latest` in CLI means the latest stable GitHub release by default.
+
+Run the recommended safe update flow:
+
+```bash
+python rnode-halow-flasher.py update --mac aa:bb:cc:dd:ee:ff --release latest
+python rnode-halow-flasher.py update --mac aa:bb:cc:dd:ee:ff --file ./firmware.tar
+```
+
+Run advanced raw flashing:
+
+```bash
+python rnode-halow-flasher.py raw-flash --mac aa:bb:cc:dd:ee:ff --release latest
+python rnode-halow-flasher.py raw-flash --mac aa:bb:cc:dd:ee:ff --release v1.2.3
+python rnode-halow-flasher.py raw-flash --mac aa:bb:cc:dd:ee:ff --file ./firmware.bin
+python rnode-halow-flasher.py raw-flash --mac aa:bb:cc:dd:ee:ff --file ./firmware.tar
+```
+
+Read IP information, reboot a device, or open the web UI:
+
+```bash
+python rnode-halow-flasher.py get-ip --mac aa:bb:cc:dd:ee:ff
+python rnode-halow-flasher.py reboot --mac aa:bb:cc:dd:ee:ff
+python rnode-halow-flasher.py open-web --mac aa:bb:cc:dd:ee:ff
+```

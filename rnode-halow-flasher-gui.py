@@ -31,45 +31,48 @@ from __future__ import annotations
 
 import json
 import os
-import ssl
-import struct
-import subprocess
 import queue
 import shutil
 import sys
-import tarfile
 import tempfile
 import threading
 import time
-import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List, Set
+from typing import Any, Dict, Optional, Tuple, List
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-try:
-    import pwd  # type: ignore
-except Exception:
-    pwd = None  # type: ignore
-
-from scapy.all import Ether, Raw, AsyncSniffer  # type: ignore
-
-from modules import scan_all_parallel
+from app.common import (
+    extract_builtin_firmware,
+    file_is_tar,
+    is_builtin_source,
+    list_builtin_firmware_names,
+    main_timeout,
+    make_minimal_ota_tar_from_bin,
+    open_external_url,
+    pick_preflash_firmware_name,
+    read_builtin_firmware,
+    resolve_path,
+)
+from app.github import (
+    GhRelease,
+    REPO_URL,
+    github_download,
+    github_list_release_tags,
+    github_pick_asset,
+    gh_release_label,
+)
+from app.service import FlasherService
 from modules import HgicSession
-from modules.hgic_scan import scan_iface
 from modules.hgic_device import (
     RawEthernetAccessError,
-    async_sniffer_start_safe,
-    async_sniffer_stop_safe,
     raw_ethernet_access_message,
-    sendp_safe,
     windows_npcap_missing,
     windows_npcap_missing_message,
     WINDOWS_NPCAP_URL,
 )
-from modules.hgic_ota import ETH_P_OTA
 from modules.hgic_ota_tar import inspect_ota_tar
 
 
@@ -80,250 +83,15 @@ APP_VERSION = "1.4.2"
 # GitHub repo settings
 # ----------------------------
 
-REPO_OWNER = "I-AM-ENGINEER"
-REPO_NAME  = "RNode_Halow_Firmware"
-REPO_URL   = f"https://github.com/{REPO_OWNER}/{REPO_NAME}"
-RELEASES_URL = f"{REPO_URL}/releases/"
-GITHUB_API_RELEASES = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases"
-
 # NOTE: GitHub releases are downloaded into a temporary directory per GUI run.
 # This avoids accidentally flashing a stale cached file when user switches between
 # "GitHub release" and "Local file" modes.
 
-BUILTIN_PREFLASH_FW_CANDIDATES = [
-    "txw8301_v2.4.1.3-38247_2025.11.6_TAIXIN_WNB.bin",
-    "E611-orig.bin",
-]
-
-# ----------------------------
-# OTA / timeouts (main file only)
-# ----------------------------
-
-MAIN_TIMEOUT_SCALE = 1.0
-
-
-def main_timeout(value: float) -> float:
-    return float(value) * float(MAIN_TIMEOUT_SCALE)
-
-
-ETH_P_OTA_FW_CUSTOM_GET_IP              = 0xF0
-ETH_P_OTA_FW_CUSTOM_GET_IP_RESP         = 0xF1
-ETH_P_OTA_FW_FORMAT_LITTLEFS            = 0xF2
-ETH_P_OTA_FW_FORMAT_LITTLEFS_RESP       = 0xF3
-
-
-def pack_format_littlefs_req() -> bytes:
-    return struct.pack("BB", ETH_P_OTA_FW_FORMAT_LITTLEFS, 0)
-
-
-def parse_format_littlefs_resp_payload(b: bytes) -> Optional[int]:
-    if len(b) < 2:
-        return None
-    if b[0] != int(ETH_P_OTA_FW_FORMAT_LITTLEFS_RESP):
-        return None
-    return int(b[1])
-
-
-def open_external_url(url: str) -> bool:
-    if not url:
-        return False
-
-    if sys.platform.startswith("linux"):
-        try:
-            opener: Optional[List[str]] = None
-            if shutil.which("xdg-open"):
-                opener = ["xdg-open", url]
-            elif shutil.which("gio"):
-                opener = ["gio", "open", url]
-
-            if opener is None:
-                return False
-
-            if hasattr(os, "geteuid") and (os.geteuid() == 0):
-                sudo_user = str(os.environ.get("SUDO_USER") or "").strip()
-                if not sudo_user:
-                    return False
-
-                env_cmd: List[str] = ["env"]
-                keep_names = [
-                    "DISPLAY",
-                    "WAYLAND_DISPLAY",
-                    "XAUTHORITY",
-                    "DBUS_SESSION_BUS_ADDRESS",
-                    "XDG_RUNTIME_DIR",
-                    "DESKTOP_SESSION",
-                    "XDG_SESSION_TYPE",
-                ]
-                for name in keep_names:
-                    value = str(os.environ.get(name) or "").strip()
-                    if value:
-                        env_cmd.append(f"{name}={value}")
-
-                if pwd is not None:
-                    try:
-                        env_cmd.append(f"HOME={pwd.getpwnam(sudo_user).pw_dir}")
-                    except Exception:
-                        pass
-
-                if shutil.which("runuser"):
-                    cmd = ["runuser", "-u", sudo_user, "--", *env_cmd, *opener]
-                elif shutil.which("sudo"):
-                    cmd = ["sudo", "-u", sudo_user, *env_cmd, *opener]
-                else:
-                    return False
-
-                res = subprocess.run(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=10.0,
-                )
-                return int(res.returncode) == 0
-
-            res = subprocess.run(
-                opener,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=10.0,
-            )
-            return int(res.returncode) == 0
-        except Exception:
-            return False
-
-    try:
-        return bool(webbrowser.open(url))
-    except Exception:
-        return False
-
-
-# ----------------------------
-# Helpers
-# ----------------------------
-
-
-def strip_quotes(s: str) -> str:
-    s = s.strip()
-    if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
-        return s[1:-1].strip()
-    return s
-
-
-def resolve_path(s: str) -> Path:
-    p = Path(strip_quotes(s)).expanduser()
-    try:
-        return p.resolve()
-    except Exception:
-        return p.absolute()
-
-
-def file_is_tar(path: Path) -> bool:
-    try:
-        return tarfile.is_tarfile(path)
-    except Exception:
-        return False
-
-
-def make_minimal_ota_tar_from_bin(bin_path: Path) -> Tuple[Path, tempfile.TemporaryDirectory]:
-    td = tempfile.TemporaryDirectory(prefix="rnode_halow_tmp_")
-    tar_path = Path(td.name) / "ota_from_bin.tar"
-    with tarfile.open(tar_path, "w") as tf:
-        info = tarfile.TarInfo(name="fw.bin")
-        info.size = bin_path.stat().st_size
-        info.mtime = int(time.time())
-        with bin_path.open("rb") as f:
-            tf.addfile(info, fileobj=f)
-    return tar_path, td
-
-
-
-
-def _app_base_dir() -> Path:
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        return Path(getattr(sys, "_MEIPASS"))
-    return Path(__file__).resolve().parent
-
-
-def _builtin_fw_dir() -> Path:
-    return _app_base_dir() / "embedded_fw"
-
-
-def list_builtin_firmware_names() -> List[str]:
-    fw_dir = _builtin_fw_dir()
-    if not fw_dir.is_dir():
-        return []
-    return sorted(p.name for p in fw_dir.glob("*.bin") if p.is_file())
-
-
-def pick_preflash_firmware_name() -> str:
-    names = list_builtin_firmware_names()
-    for cand in BUILTIN_PREFLASH_FW_CANDIDATES:
-        if cand in names:
-            return cand
-    if names:
-        return names[0]
-    raise FileNotFoundError(f"no built-in firmware found in: {_builtin_fw_dir()}")
-
-
-def extract_builtin_firmware(name: str, dst_dir: Path) -> Path:
-    src = _builtin_fw_dir() / str(name)
-    if not src.is_file():
-        raise FileNotFoundError(f"built-in firmware not found: {src}")
-
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst = dst_dir / src.name
-    if (not dst.exists()) or (dst.stat().st_size != src.stat().st_size):
-        shutil.copy2(src, dst)
-    return dst
-
-
-def read_builtin_firmware(name: str) -> bytes:
-    src = _builtin_fw_dir() / str(name)
-    if not src.is_file():
-        raise FileNotFoundError(f"built-in firmware not found: {src}")
-    data = src.read_bytes()
-    if not data:
-        raise ValueError(f"built-in firmware is empty: {src.name}")
-    return data
-
-
-def is_builtin_source(src: str) -> bool:
-    return str(src or "").strip() == "builtin"
-
-
-def _build_ssl_context() -> ssl.SSLContext:
-    try:
-        import certifi  # type: ignore
-        cafile = str(certifi.where())
-        if cafile:
-            return ssl.create_default_context(cafile=cafile)
-    except Exception:
-        pass
-    return ssl.create_default_context()
-
-
-def _normalize_network_error(exc: BaseException) -> BaseException:
-    reason = getattr(exc, "reason", None)
-    if isinstance(exc, ssl.SSLCertVerificationError) or isinstance(reason, ssl.SSLCertVerificationError):
-        return RuntimeError(
-            "TLS certificate verification failed for GitHub. "
-            "Install or update the system CA certificates, or install the Python package 'certifi'."
-        )
-    return exc
-
-
-def _urlopen(req, timeout_s: float):
-    import urllib.request
-    try:
-        return urllib.request.urlopen(req, timeout=float(timeout_s), context=_build_ssl_context())
-    except Exception as exc:
-        raise _normalize_network_error(exc) from exc
-
-
 def http_get_json(url: str, timeout_s: float = main_timeout(1.0)) -> Optional[Dict[str, Any]]:
     try:
         import urllib.request
+        from app.github import _urlopen  # local import avoids widening the public surface here
+
         req = urllib.request.Request(url, headers={"User-Agent": "rnode-halow-gui"})
         with _urlopen(req, timeout_s) as r:
             data = r.read()
@@ -350,151 +118,8 @@ def is_rnode_halow_by_scan(ver: str) -> bool:
     return (ver or "").strip() == "0.0.0.0"
 
 
-def fmt_iface(d: Any) -> str:
-    iface = getattr(d, "iface_name", None)
-    if not iface:
-        iface = getattr(d, "iface_id", None)
-    if not iface:
-        iface = getattr(d, "iface", None)
-    return str(iface) if iface is not None else "?"
-
-
-def fmt_iface_id(d: Any) -> str:
-    iface = getattr(d, "iface_id", None)
-    if iface:
-        return str(iface)
-    return fmt_iface(d)
-
-
-def fmt_mac(d: Any) -> str:
-    return str(getattr(d, "src_mac", "")).lower()
-
-
-def fmt_scan_ver(d: Any) -> str:
-    return str(getattr(d, "version_str", "")).strip()
-
-
-# ----------------------------
-# GitHub API (single asset)
-# ----------------------------
-
-@dataclass
-class GhAsset:
-    name: str
-    size: int
-    url: str
-
-    @property
-    def ext(self) -> str:
-        return Path(self.name).suffix.lower()
-
-    @property
-    def is_tar(self) -> bool:
-        return self.ext == ".tar"
-
-    @property
-    def is_bin(self) -> bool:
-        return self.ext == ".bin"
-
-
-@dataclass
-class GhRelease:
-    tag: str
-    assets: List[GhAsset]
-    prerelease: bool = False
-
-
-def gh_release_label(rel: GhRelease) -> str:
-    tag = str(rel.tag or "").strip()
-    if rel.prerelease:
-        return f"{tag} (beta)"
-    return tag
-
-
-def github_list_release_tags(
-    *,
-    timeout_s: float = main_timeout(8.0),
-) -> List[GhRelease]:
-    import urllib.request
-    req = urllib.request.Request(GITHUB_API_RELEASES, headers={"User-Agent": "rnode-halow-gui"})
-    with _urlopen(req, timeout_s) as r:
-        data = r.read()
-    obj = json.loads(data.decode("utf-8", errors="replace"))
-    if not isinstance(obj, list):
-        return []
-
-    rels: List[GhRelease] = []
-    for rr in obj:
-        if not isinstance(rr, dict):
-            continue
-        tag = str(rr.get("tag_name") or "").strip()
-        if not tag:
-            continue
-
-        prerelease = bool(rr.get("prerelease"))
-
-        assets: List[GhAsset] = []
-        a_raw = rr.get("assets")
-        if isinstance(a_raw, list):
-            for a in a_raw:
-                if not isinstance(a, dict):
-                    continue
-                nm = str(a.get("name") or "").strip()
-                url = str(a.get("browser_download_url") or "").strip()
-                sz = int(a.get("size") or 0)
-                if not nm or not url:
-                    continue
-                ext = Path(nm).suffix.lower()
-                if ext not in (".tar", ".bin"):
-                    continue
-                assets.append(GhAsset(name=nm, size=sz, url=url))
-
-        rels.append(GhRelease(tag=tag, assets=assets, prerelease=prerelease))
-
-    return rels
-
-
-def github_pick_asset(rel: GhRelease) -> Optional[GhAsset]:
-    # Prefer modern OTA tar
-    for a in rel.assets:
-        if a.is_tar:
-            return a
-    for a in rel.assets:
-        if a.is_bin:
-            return a
-    return None
-
-
-def github_download(url: str, out_path: Path, progress_cb=None, timeout_s: float = main_timeout(30.0)) -> None:
-    import urllib.request
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "rnode-halow-gui",
-            "Accept": "application/octet-stream",
-        },
-    )
-
-    with _urlopen(req, timeout_s) as r:
-        total = int(r.headers.get("Content-Length") or 0)
-        done = 0
-        t0 = time.time()
-
-        with out_path.open("wb") as f:
-            while True:
-                chunk = r.read(64 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-
-                if progress_cb:
-                    dt = max(0.001, time.time() - t0)
-                    speed = done / dt
-                    progress_cb(done, total, speed)
+def should_require_preflash(firmware_mode: str) -> bool:
+    return str(firmware_mode or "").strip() == "ota"
 
 
 # ----------------------------
@@ -513,14 +138,6 @@ class DevRow:
 
     def key(self) -> Tuple[str, str]:
         return (self.mac, self.iface_id)
-
-
-@dataclass
-class FlashTargetState:
-    iface_id: str
-    current_mac: str
-    allowed_macs: Set[str] = field(default_factory=set)
-    blacklist_macs: Set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -546,6 +163,7 @@ class App(tk.Tk):
 
         self._q: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self._stop = threading.Event()
+        self._service = FlasherService()
 
         # pcap/network serialization
         self._pcap_lock = threading.RLock()
@@ -1179,7 +797,7 @@ class App(tk.Tk):
         if not self._pcap_lock.acquire(blocking=False):
             return
         try:
-            devs = scan_all_parallel(packet_cnt=10, period_sec=main_timeout(0.010), sniff_time=main_timeout(0.5))
+            rows, seen = self._service.scan_devices(existing_rows=self._rows)
         except RawEthernetAccessError as e:
             self._queue_raw_ethernet_warning(str(e))
             return
@@ -1192,27 +810,46 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        now = time.time()
-        seen: set[Tuple[str, str]] = set()
-        rows: List[DevRow] = []
-
-        for d in devs or []:
-            mac = fmt_mac(d)
-            iface = fmt_iface(d)
-            iface_id = fmt_iface_id(d)
-            ver = fmt_scan_ver(d)
-            kind = "rnode-halow" if is_rnode_halow_by_scan(ver) else "hgic"
-
-            key = (mac, iface_id)
-            seen.add(key)
-
-            r = self._rows.get(key, DevRow(mac=mac, iface=iface, iface_id=iface_id))
-            r.iface = iface
-            r.kind = kind
-            r.last_seen_ts = now
-            rows.append(r)
-
         self._q.put(("scan", (rows, seen)))
+
+    def _emit_service_event(self, row: DevRow, event: Any) -> None:
+        kind = str(getattr(event, "kind", "") or "")
+        message = str(getattr(event, "message", "") or "")
+        data = dict(getattr(event, "data", {}) or {})
+
+        if kind == "stage":
+            self._q.put(("log", ("[*] " + message, "stage")))
+            return
+        if kind == "warning":
+            tag = "err" if "failed" in message else "stage"
+            prefix = "[!]" if tag == "err" else "[*]"
+            self._q.put(("log", (f"{prefix} {message}", tag)))
+            return
+        if kind == "progress":
+            self._q.put(
+                (
+                    "progress",
+                    (
+                        float(data.get("pct") or 0.0),
+                        int(data.get("done") or 0),
+                        int(data.get("total") or 0),
+                        float(data.get("speed") or 0.0),
+                    ),
+                )
+            )
+            return
+        if kind == "device_changed":
+            self._q.put(("log", ("[*] " + message, "stage")))
+            return
+        if kind == "device_ip":
+            self._q.put(("devinfo", (row.key(), str(data.get("ip") or message or ""), "")))
+            return
+        if kind == "done":
+            self._q.put(("log", ("[OK] " + message, "ok")))
+            return
+        if kind == "error":
+            self._q.put(("log", ("[ERR] " + message, "err")))
+            return
 
     def _maybe_poll_ip(self, r: DevRow) -> None:
         key = r.key()
@@ -1330,7 +967,7 @@ class App(tk.Tk):
             messagebox.showerror("No firmware", "Select a firmware first.")
             return
 
-        needs_preflash = not is_builtin_source(fw.source)
+        needs_preflash = should_require_preflash(fw.mode)
         if needs_preflash:
             try:
                 pick_preflash_firmware_name()
@@ -1367,92 +1004,33 @@ class App(tk.Tk):
         try:
             with self._pcap_lock:
                 with self._iface_lock(r.iface_id):
-                    sess = HgicSession(r.iface_id)
-                    target = self._build_flash_target_state(r)
-                    if target.blacklist_macs:
-                        self._q.put(("log", (f"[*] blacklist active: {', '.join(sorted(target.blacklist_macs))}", "stage")))
-
                     def cb_progress(done: int, total: int, speed: float) -> None:
                         pct = (done * 100.0 / total) if total else 0.0
                         self._q.put(("progress", (pct, done, total, speed)))
 
-                    def cb_stage(msg: str) -> None:
-                        self._q.put(("log", ("[*] " + msg, "stage")))
-
-                    def cb_retry(attempt: int, total: int, err: str) -> None:
-                        self._q.put(("log", (f"[!] flash attempt {attempt}/{total} failed: {err}; retry in 3s", "err")))
-
                     fw_path, mode = self._resolve_selection_path(fw_sel, progress_cb=cb_progress)
-                    needs_preflash = not is_builtin_source(fw_sel.source)
-                    has_www_dir = False
-                    if mode == "ota":
-                        info = inspect_ota_tar(fw_path)
-                        has_www_dir = bool(info.has_www_dir)
-
-                    if needs_preflash:
-                        preflash_name = pick_preflash_firmware_name()
-                        self._q.put(("log", (f'[*] flash original firmware "{preflash_name}"', "stage")))
-                        sess.flash(target.current_mac, read_builtin_firmware(preflash_name), timeout=main_timeout(5.45), retries=5, progress_cb=cb_progress, retry_cb=cb_retry)
-                        self._q.put(("log", ("[OK] original firmware flashed", "ok")))
-                        self._q.put(("log", ("[*] reboot original firmware", "stage")))
-                        sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-                        self._q.put(("log", ("[*] waiting original firmware reboot...", "stage")))
-                        if not self._wait_hgic_ready(target, overall_timeout_s=main_timeout(15.0)):
-                            raise RuntimeError("original firmware did not return as HGIC within 15 seconds")
-                        self._q.put(("log", ("[*] waiting original firmware settle...", "stage")))
-                        time.sleep(main_timeout(5.0))
-                        self._q.put(("log", ("[OK] original firmware is back online", "ok")))
+                    resolved = FirmwareSelection(
+                        source=fw_sel.source,
+                        mode=mode,
+                        path=fw_path,
+                        label=fw_sel.label,
+                        github_tag=fw_sel.github_tag,
+                    )
 
                     if mode == "bin":
-                        self._q.put(("log", ("[*] flash rnode-halow firmware", "stage")))
-                        tar_p, td = make_minimal_ota_tar_from_bin(fw_path)
-                        try:
-                            sess.flash(target.current_mac, tar_p, timeout=main_timeout(5.0), retries=5, progress_cb=cb_progress, retry_cb=cb_retry)
-                            self._q.put(("log", ("[OK] rnode-halow firmware flashed", "ok")))
-                        finally:
-                            try:
-                                td.cleanup()
-                            except Exception:
-                                pass
-
-                        self._q.put(("log", ("[*] reboot", "stage")))
-                        sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-                        self._q.put(("log", ("[OK] reboot sent", "ok")))
-                        return
-
-                    # mode == "ota"
-                    self._q.put(("log", ("[*] flash rnode-halow firmware", "stage")))
-                    sess.flash(target.current_mac, fw_path, timeout=main_timeout(5.45), retries=5, progress_cb=cb_progress, retry_cb=cb_retry)
-                    self._q.put(("log", ("[OK] rnode-halow firmware flashed", "ok")))
-
-                    self._q.put(("log", ("[*] reboot", "stage")))
-                    sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-
-                    if not has_www_dir:
-                        self._q.put(("log", ("[OK] flash done", "ok")))
-                        return
-
-                    self._q.put(("log", ("[*] waiting IP…", "stage")))
-                    ip_s = self._wait_ip(sess, target, overall_timeout_s=main_timeout(80.0))
-                    if not ip_s:
-                        self._q.put(("log", ("[ERR] IP not acquired (timeout).", "err")))
-                        return
-                    self._q.put(("devinfo", (r.key(), ip_s, "")))
-
-                    self._q.put(("log", ("[*] format LittleFS", "stage")))
-                    self._format_littlefs(sess, target.current_mac)
-                    self._q.put(("log", ("[OK] LittleFS formatted", "ok")))
-                    self._q.put(("log", ("[*] reboot after LittleFS format", "stage")))
-                    sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-                    self._q.put(("log", ("[*] waiting IP after LittleFS format reboot…", "stage")))
-                    ip_s = self._wait_ip(sess, target, overall_timeout_s=main_timeout(80.0))
-                    if not ip_s:
-                        self._q.put(("log", ("[ERR] IP not acquired after LittleFS format reboot (timeout).", "err")))
-                        return
-                    self._q.put(("devinfo", (r.key(), ip_s, "")))
-                    self._q.put(("log", ("[*] upload filesystem via TFTP", "stage")))
-                    sess.flash_fs(target.current_mac, fw_path, stage_cb=cb_stage, progress_cb=cb_progress)
-                    self._q.put(("log", ("[OK] flash done", "ok")))
+                        self._service.run_raw_flash(
+                            r,
+                            resolved,
+                            known_rows=list(self._rows.values()),
+                            emit=lambda event: self._emit_service_event(r, event),
+                        )
+                    else:
+                        self._service.run_update_device(
+                            r,
+                            resolved,
+                            known_rows=list(self._rows.values()),
+                            emit=lambda event: self._emit_service_event(r, event),
+                        )
 
             self._maybe_poll_ip(self._rows.get(r.key(), r))
         except RawEthernetAccessError as e:
@@ -1462,155 +1040,6 @@ class App(tk.Tk):
         finally:
             self._q.put(("progress", (0.0, 0, 0, 0.0)))
             self._q.put(("busy", False))
-
-    def _build_flash_target_state(self, r: DevRow) -> FlashTargetState:
-        current_mac = str(r.mac or "").lower()
-        blacklist_macs: Set[str] = set()
-
-        for row in self._rows.values():
-            row_mac = str(getattr(row, "mac", "") or "").lower()
-            if not row_mac:
-                continue
-            if str(getattr(row, "iface_id", "") or "") != str(r.iface_id or ""):
-                continue
-            if row_mac == current_mac:
-                continue
-            blacklist_macs.add(row_mac)
-
-        return FlashTargetState(
-            iface_id=str(r.iface_id or ""),
-            current_mac=current_mac,
-            allowed_macs={current_mac},
-            blacklist_macs=blacklist_macs,
-        )
-
-    def _scan_live_targets(self, state: FlashTargetState) -> List[Tuple[str, str]]:
-        try:
-            devs = scan_iface(state.iface_id, packet_cnt=6, period_sec=main_timeout(0.010), sniff_time=main_timeout(0.35))
-        except RawEthernetAccessError as e:
-            self._queue_raw_ethernet_warning(str(e))
-            return []
-        except Exception:
-            return []
-
-        out: List[Tuple[str, str]] = []
-        seen: Set[str] = set()
-        for d in devs or []:
-            mac = fmt_mac(d)
-            if not mac or mac in seen or mac in state.blacklist_macs:
-                continue
-            kind = "rnode-halow" if is_rnode_halow_by_scan(fmt_scan_ver(d)) else "hgic"
-            out.append((mac, kind))
-            seen.add(mac)
-        return out
-
-    def _pick_live_target_mac(self, state: FlashTargetState, *, prefer_kind: Optional[str] = None) -> Optional[str]:
-        candidates = self._scan_live_targets(state)
-        if not candidates:
-            return None
-
-        ordered: List[str] = []
-        preferred: List[str] = []
-        fallback: List[str] = []
-
-        for mac, kind in candidates:
-            if prefer_kind is not None and kind == prefer_kind:
-                preferred.append(mac)
-            else:
-                fallback.append(mac)
-
-        ordered.extend(preferred)
-        ordered.extend(fallback)
-
-        picked: Optional[str] = None
-        if state.current_mac in ordered:
-            picked = state.current_mac
-        else:
-            for mac in ordered:
-                if mac in state.allowed_macs:
-                    picked = mac
-                    break
-            if picked is None:
-                picked = ordered[0]
-
-        if picked is None:
-            return None
-
-        old_mac = state.current_mac
-        is_new_mac = picked not in state.allowed_macs
-        state.allowed_macs.add(picked)
-        state.current_mac = picked
-
-        if is_new_mac and old_mac and old_mac != picked:
-            self._q.put(("log", (f"[*] target MAC changed: {old_mac} -> {picked}", "stage")))
-        if len(ordered) > 1 and picked != old_mac:
-            self._q.put(("log", (f"[!] multiple non-blacklisted devices visible; using {picked}", "err")))
-
-        return picked
-
-    def _wait_hgic_ready(self, state: FlashTargetState, *, overall_timeout_s: float = main_timeout(15.0)) -> bool:
-        t0 = time.time()
-        while time.time() - t0 < overall_timeout_s:
-            if self._pick_live_target_mac(state, prefer_kind="hgic"):
-                return True
-            time.sleep(main_timeout(0.20))
-        return False
-
-    def _wait_ip(self, sess: HgicSession, state: FlashTargetState, *, overall_timeout_s: float = main_timeout(60.0)) -> Optional[str]:
-        t0 = time.time()
-        while time.time() - t0 < overall_timeout_s:
-            mac = self._pick_live_target_mac(state, prefer_kind="rnode-halow")
-            if mac is None:
-                mac = state.current_mac
-            try:
-                ans = sess.get_ip(mac, tries=1, timeout=main_timeout(0.5))
-            except RawEthernetAccessError as e:
-                self._queue_raw_ethernet_warning(str(e))
-                ans = None
-            except Exception:
-                ans = None
-            if ans is not None:
-                ip_s = str(getattr(ans, "ip", "") or "")
-                if ip_s and ip_s != "0.0.0.0":
-                    return ip_s
-            time.sleep(main_timeout(0.4))
-        return None
-
-    def _format_littlefs(self, sess: HgicSession, mac: str) -> None:
-        dst_mac_s = str(mac or "").lower()
-        host_mac_s = str(sess.host_mac or "").lower()
-        payload = pack_format_littlefs_req()
-
-        def is_my_resp(p) -> bool:
-            if not p.haslayer(Ether) or not p.haslayer(Raw):
-                return False
-            eth = p[Ether]
-            if int(eth.type) != int(ETH_P_OTA):
-                return False
-            return (eth.src or "").lower() == dst_mac_s and (eth.dst or "").lower() == host_mac_s
-
-        frame = Ether(src=host_mac_s, dst=dst_mac_s, type=ETH_P_OTA) / Raw(load=payload)
-
-        for _ in range(3):
-            sn = AsyncSniffer(iface=sess.iface, store=True, lfilter=is_my_resp)
-            async_sniffer_start_safe(sn)
-            try:
-                sendp_safe(frame, iface=sess.iface, verbose=False)
-                sn.join(timeout=main_timeout(15.0))
-            finally:
-                pkts = async_sniffer_stop_safe(sn) or []
-
-            for p in pkts:
-                status = parse_format_littlefs_resp_payload(bytes(p[Raw].load))
-                if status is None:
-                    continue
-                if status != 0:
-                    raise RuntimeError(f"LittleFS format failed: status={status}")
-                return
-
-            time.sleep(main_timeout(0.4))
-
-        raise RuntimeError("LittleFS format failed: timeout")
 
     def _reboot_selected(self) -> None:
         r = self._ensure_selected()
@@ -1632,143 +1061,17 @@ class App(tk.Tk):
         try:
             with self._pcap_lock:
                 with self._iface_lock(r.iface_id):
-                    sess = HgicSession(r.iface_id)
-                    target = self._build_flash_target_state(r)
-                    if target.blacklist_macs:
-                        self._q.put(("log", (f"[*] blacklist active: {', '.join(sorted(target.blacklist_macs))}", "stage")))
-                    self._q.put(("log", ("[*] reboot", "stage")))
-                    sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-                    self._q.put(("log", ("[OK] reboot sent", "ok")))
+                    self._service.run_reboot(
+                        r,
+                        known_rows=list(self._rows.values()),
+                        emit=lambda event: self._emit_service_event(r, event),
+                    )
         except RawEthernetAccessError as e:
             self._queue_raw_ethernet_warning(str(e))
         except Exception as e:
             self._q.put(("log", (f"[ERR] reboot failed: {e}", "err")))
         finally:
             self._q.put(("busy", False))
-
-
-    def _update_worker(self, r: DevRow, tar_path: Path) -> None:
-        try:
-            with self._pcap_lock:
-                with self._iface_lock(r.iface_id):
-                    sess = HgicSession(r.iface_id)
-                    target = self._build_flash_target_state(r)
-                    if target.blacklist_macs:
-                        self._q.put(("log", (f"[*] blacklist active: {', '.join(sorted(target.blacklist_macs))}", "stage")))
-
-                    def cb_progress(done: int, total: int, speed: float) -> None:
-                        pct = (done * 100.0 / total) if total else 0.0
-                        self._q.put(("progress", (pct, done, total, speed)))
-
-                    def cb_stage(msg: str) -> None:
-                        self._q.put(("log", ("[*] " + msg, "stage")))
-
-                    def cb_retry(attempt: int, total: int, err: str) -> None:
-                        self._q.put(("log", (f"[!] flash attempt {attempt}/{total} failed: {err}; retry in 3s", "err")))
-
-                    info = inspect_ota_tar(tar_path)
-
-                    preflash_name = pick_preflash_firmware_name()
-                    self._q.put(("log", (f'[*] flash original firmware "{preflash_name}"', "stage")))
-                    sess.flash(target.current_mac, read_builtin_firmware(preflash_name), timeout=main_timeout(5.45), retries=5, progress_cb=cb_progress, retry_cb=cb_retry)
-                    self._q.put(("log", ("[OK] original firmware flashed", "ok")))
-                    self._q.put(("log", ("[*] reboot original firmware", "stage")))
-                    sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-                    self._q.put(("log", ("[*] waiting original firmware reboot...", "stage")))
-                    if not self._wait_hgic_ready(target, overall_timeout_s=main_timeout(15.0)):
-                        raise RuntimeError("original firmware did not return as HGIC within 15 seconds")
-                    self._q.put(("log", ("[*] waiting original firmware settle...", "stage")))
-                    time.sleep(main_timeout(5.0))
-                    self._q.put(("log", ("[OK] original firmware is back online", "ok")))
-
-                    # Stage 1: always flash firmware first via HGIC (fw.bin from ota.tar)
-                    self._q.put(("log", ("[*] flash rnode-halow firmware", "stage")))
-                    # slightly lower retries vs old GUI to avoid "unnecessary retries"
-                    sess.flash(target.current_mac, tar_path, timeout=main_timeout(5.45), retries=5, progress_cb=cb_progress, retry_cb=cb_retry)
-                    self._q.put(("log", ("[OK] rnode-halow firmware flashed", "ok")))
-
-                    self._q.put(("log", ("[*] reboot", "stage")))
-                    sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-
-                    if not info.has_www_dir:
-                        self._q.put(("log", ("[OK] flash done", "ok")))
-                        return
-
-                    self._q.put(("log", ("[*] waiting IP…", "stage")))
-                    ip_s = self._wait_ip(sess, target, overall_timeout_s=main_timeout(80.0))
-                    if not ip_s:
-                        self._q.put(("log", ("[ERR] IP not acquired (timeout).", "err")))
-                        return
-                    self._q.put(("devinfo", (r.key(), ip_s, "")))
-
-                    # Stage 2 (TFTP): upload filesystem files directly from ota.tar
-                    self._q.put(("log", ("[*] format LittleFS", "stage")))
-                    self._format_littlefs(sess, target.current_mac)
-                    self._q.put(("log", ("[OK] LittleFS formatted", "ok")))
-                    self._q.put(("log", ("[*] reboot after LittleFS format", "stage")))
-                    sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-                    self._q.put(("log", ("[*] waiting IP after LittleFS format reboot…", "stage")))
-                    ip_s = self._wait_ip(sess, target, overall_timeout_s=main_timeout(80.0))
-                    if not ip_s:
-                        self._q.put(("log", ("[ERR] IP not acquired after LittleFS format reboot (timeout).", "err")))
-                        return
-                    self._q.put(("devinfo", (r.key(), ip_s, "")))
-                    self._q.put(("log", ("[*] upload filesystem via TFTP", "stage")))
-                    sess.flash_fs(target.current_mac, tar_path, stage_cb=cb_stage, progress_cb=cb_progress)
-                    self._q.put(("log", ("[OK] flash done", "ok")))
-
-            # refresh ip/version (best-effort)
-            self._maybe_poll_ip(self._rows.get(r.key(), r))
-        except RawEthernetAccessError as e:
-            self._queue_raw_ethernet_warning(str(e))
-        except Exception as e:
-            self._q.put(("log", (f"[ERR] update failed: {e}", "err")))
-        finally:
-            self._q.put(("progress", (0.0, 0, 0, 0.0)))
-            self._q.put(("busy", False))
-
-    def _raw_worker(self, r: DevRow, fw_path: Path, mode: str) -> None:
-        try:
-            with self._pcap_lock:
-                with self._iface_lock(r.iface_id):
-                    sess = HgicSession(r.iface_id)
-                    target = self._build_flash_target_state(r)
-                    if target.blacklist_macs:
-                        self._q.put(("log", (f"[*] blacklist active: {', '.join(sorted(target.blacklist_macs))}", "stage")))
-
-                    def cb_progress(done: int, total: int, speed: float) -> None:
-                        pct = (done * 100.0 / total) if total else 0.0
-                        self._q.put(("progress", (pct, done, total, speed)))
-
-                    def cb_retry(attempt: int, total: int, err: str) -> None:
-                        self._q.put(("log", (f"[!] flash attempt {attempt}/{total} failed: {err}; retry in 3s", "err")))
-
-                    if mode == "ota":
-                        self._q.put(("log", ("[*] RAW flash (ota.tar)", "stage")))
-                        sess.flash(target.current_mac, fw_path, timeout=main_timeout(5.0), retries=5, progress_cb=cb_progress, retry_cb=cb_retry)
-                        self._q.put(("log", ("[OK] RAW flash done", "ok")))
-                    else:
-                        self._q.put(("log", ("[*] RAW flash (bin)", "stage")))
-                        tar_p, td = make_minimal_ota_tar_from_bin(fw_path)
-                        try:
-                            sess.flash(target.current_mac, tar_p, timeout=main_timeout(5.0), retries=5, progress_cb=cb_progress, retry_cb=cb_retry)
-                            self._q.put(("log", ("[OK] RAW flash done", "ok")))
-                        finally:
-                            try:
-                                td.cleanup()
-                            except Exception:
-                                pass
-
-
-                    self._q.put(("log", ("[*] reboot", "stage")))
-                    sess.reboot(target.current_mac, flags=0, count=3, period_sec=main_timeout(0.05))
-                    self._q.put(("log", ("[OK] reboot sent", "ok")))
-        except RawEthernetAccessError as e:
-            self._queue_raw_ethernet_warning(str(e))
-        except Exception as e:
-            self._q.put(("log", (f"[ERR] RAW flash failed: {e}", "err")))
-        finally:
-            self._q.put(("progress", (0.0, 0, 0, 0.0)))
             self._q.put(("busy", False))
 
     # ---------- Tree update helpers ----------

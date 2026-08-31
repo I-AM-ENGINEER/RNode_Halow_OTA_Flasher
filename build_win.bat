@@ -3,14 +3,21 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 cd /d "%~dp0"
 
-set "APP_PY=rnode-halow-flasher-gui.py"
+set "APP_PY_GUI=rnode-halow-flasher-gui.py"
+set "APP_PY_CLI=rnode-halow-flasher.py"
 set "VENV_DIR=.venv"
 set "DIST_DIR=dist"
 set "BUILD_DIR=build"
-set "SPEC_NAME=rnode-halow-flasher-gui"
+set "SPEC_NAME_GUI=rnode-halow-flasher-gui"
+set "SPEC_NAME_CLI=rnode-halow-flasher"
 
-if not exist "%APP_PY%" (
-  echo [!] "%APP_PY%" not found in: %cd%
+if not exist "%APP_PY_GUI%" (
+  echo [!] "%APP_PY_GUI%" not found in: %cd%
+  exit /b 1
+)
+
+if not exist "%APP_PY_CLI%" (
+  echo [!] "%APP_PY_CLI%" not found in: %cd%
   exit /b 1
 )
 
@@ -46,31 +53,51 @@ if errorlevel 1 exit /b 1
 
 if exist "%DIST_DIR%\" rmdir /s /q "%DIST_DIR%"
 if exist "%BUILD_DIR%\" rmdir /s /q "%BUILD_DIR%"
-if exist "%SPEC_NAME%.spec" del /q "%SPEC_NAME%.spec" >nul 2>nul
+if exist "%SPEC_NAME_GUI%.spec" del /q "%SPEC_NAME_GUI%.spec" >nul 2>nul
+if exist "%SPEC_NAME_CLI%.spec" del /q "%SPEC_NAME_CLI%.spec" >nul 2>nul
 
-echo [*] Building EXE...
+echo [*] Building GUI EXE...
 "%VPY%" -m PyInstaller ^
   --noconfirm ^
   --clean ^
   --onefile ^
   --noconsole ^
-  --name "%SPEC_NAME%" ^
+  --name "%SPEC_NAME_GUI%" ^
   --icon rns.ico ^
   --add-data "modules;modules" ^
   --add-data "embedded_fw;embedded_fw" ^
   --collect-all scapy ^
   --collect-all tftpy ^
   --hidden-import tftpy ^
-  "%APP_PY%"
+  "%APP_PY_GUI%"
 
 if errorlevel 1 (
-  echo [!] Build failed.
+  echo [!] GUI build failed.
+  exit /b 1
+)
+
+echo [*] Building CLI EXE...
+"%VPY%" -m PyInstaller ^
+  --noconfirm ^
+  --clean ^
+  --onefile ^
+  --name "%SPEC_NAME_CLI%" ^
+  --add-data "modules;modules" ^
+  --add-data "embedded_fw;embedded_fw" ^
+  --collect-all scapy ^
+  --collect-all tftpy ^
+  --hidden-import tftpy ^
+  "%APP_PY_CLI%"
+
+if errorlevel 1 (
+  echo [!] CLI build failed.
   exit /b 1
 )
 
 echo.
 echo [OK] Done:
-echo     %cd%\%DIST_DIR%\%SPEC_NAME%.exe
+echo     %cd%\%DIST_DIR%\%SPEC_NAME_GUI%.exe
+echo     %cd%\%DIST_DIR%\%SPEC_NAME_CLI%.exe
 echo.
 pause
 exit /b 0
